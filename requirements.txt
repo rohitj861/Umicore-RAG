@@ -1,0 +1,12 @@
+langchain
+langgraph
+langchain-google-genai
+langchain-openai
+python-dotenv
+youtube-transcript-api
+BeautifulSoup
+langchain_community
+langchain-chroma
+chromadb
+pypdf
+langchain-classic
