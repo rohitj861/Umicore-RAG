@@ -10,6 +10,10 @@ venv/
 # Generated vector store
 chroma_db/
 
+# Source documents. The report is Umicore's to distribute, not ours, so it
+# is kept out of the repo; drop your own copy in this folder to run ingest.
+*.pdf
+
 # Python caches
 __pycache__/
 *.py[cod]

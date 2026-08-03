@@ -27,7 +27,11 @@ py -3.14 -m venv .venv
 Copy-Item .env.example .env
 notepad .env
 
-# 3. Read the PDF into the vector database (~1-2 min, costs a few cents)
+# 3. The report is not in this repo. Download it from Umicore and save it in
+#    this folder as exactly: Umicore Annual Report 2025.pdf
+#    (Any PDF works if you change pdf_path in ingest.py.)
+
+# 4. Read the PDF into the vector database (~1-2 min, costs a few cents)
 .\.venv\Scripts\python.exe ingest.py
 ```
 
@@ -98,6 +102,7 @@ chunks must be embedded by the same model.
 | Message | Fix |
 | --- | --- |
 | `OPENAI_API_KEY not found.` | Create `.env` with your key. Watch for Notepad saving it as `.env.txt`. |
+| `PDF not found at: ...` | The report is not bundled. Save your copy in this folder as `Umicore Annual Report 2025.pdf`. |
 | `Vector store './chroma_db' not found.` | Run `ingest.py` first. |
 | `Collection ... is empty.` | Re-run `ingest.py`. |
 | Answers are "I don't know" too often | Raise `TOP_K` / `MAX_CONTEXT_CHUNKS` in `ask.py`. |
@@ -110,6 +115,5 @@ way, and don't commit `chroma_db/` either (it's ignored too).
 
 Source code is MIT licensed — see [LICENSE](LICENSE).
 
-The MIT license covers the source code only. `Umicore Annual Report 2025.pdf`
-is bundled as sample input; it is published by Umicore, remains its property,
-and is not licensed by this repository.
+The report itself is not included in this repository — it is published by
+Umicore and is theirs to distribute.
