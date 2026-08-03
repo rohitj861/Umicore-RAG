@@ -113,7 +113,7 @@ QUERY_PROMPT = ChatPromptTemplate.from_messages(
 
 
 def _page_label(doc: Document) -> str:
-    """Human-friendly 1-based page number from PyPDFLoader metadata."""
+    """Human-friendly 1-based page number from the metadata ingest.py writes."""
     page = doc.metadata.get("page")
     try:
         return str(int(page) + 1)
@@ -273,6 +273,11 @@ def print_answer(answer: str, sources: list[Document]) -> None:
 
 
 def main() -> None:
+    # Answers quote the report verbatim, so they carry euro signs and whatever
+    # else the PDF uses. A redirected stdout is cp1252 on Windows and would
+    # raise UnicodeEncodeError on the first character it cannot map.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     bot = PdfChatbot()
 
     # One-shot mode:  python ask.py "What were the 2025 revenues?"

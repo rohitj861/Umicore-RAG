@@ -2,6 +2,7 @@
 # from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -106,10 +107,6 @@ def ingest_pdf_to_chroma(
         collection_name=collection_name,
     )
 
-    # Some versions auto-persist; calling persist() is still fine in many setups.
-    if hasattr(vectordb, "persist"):
-        vectordb.persist()
-
     print(
         f"   ✅ Vector store ready at ./{persist_dir} (collection: {collection_name})"
     )
@@ -128,6 +125,12 @@ def ingest_pdf_to_chroma(
 
 
 def main() -> None:
+    # The Windows console is UTF-8, but a redirected or piped stdout falls back
+    # to cp1252, which cannot encode the checkmark below (or much of what a PDF
+    # may contain). Without this, 'python ingest.py > log.txt' dies on the
+    # success message after the store has already been built.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     ingest_pdf_to_chroma(
         pdf_path="Umicore Annual Report 2025.pdf",
         persist_dir="chroma_db",
