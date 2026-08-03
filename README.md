@@ -110,5 +110,6 @@ way, and don't commit `chroma_db/` either (it's ignored too).
 
 Source code is MIT licensed — see [LICENSE](LICENSE).
 
-`Umicore Annual Report 2025.pdf` is bundled as sample input only. It is
-published by Umicore and is not covered by the MIT license above.
+The MIT license covers the source code only. `Umicore Annual Report 2025.pdf`
+is bundled as sample input; it is published by Umicore, remains its property,
+and is not licensed by this repository.
