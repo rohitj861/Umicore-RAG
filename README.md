@@ -105,3 +105,10 @@ chunks must be embedded by the same model.
 
 Note: `.env` holds a real API key. It's already in `.gitignore` — keep it that
 way, and don't commit `chroma_db/` either (it's ignored too).
+
+## License
+
+Source code is MIT licensed — see [LICENSE](LICENSE).
+
+`Umicore Annual Report 2025.pdf` is bundled as sample input only. It is
+published by Umicore and is not covered by the MIT license above.
