@@ -101,6 +101,7 @@ chunks must be embedded by the same model.
 | `Vector store './chroma_db' not found.` | Run `ingest.py` first. |
 | `Collection ... is empty.` | Re-run `ingest.py`. |
 | Answers are "I don't know" too often | Raise `TOP_K` / `MAX_CONTEXT_CHUNKS` in `ask.py`. |
+| `chroma_db/` grows by ~9 MB per ingest | Expected. Chroma drops the old collection but leaves its UUID-named folder on disk. To reclaim: delete the whole `chroma_db/` folder and re-run `ingest.py`. |
 
 Note: `.env` holds a real API key. It's already in `.gitignore` — keep it that
 way, and don't commit `chroma_db/` either (it's ignored too).
