@@ -8,6 +8,7 @@ with "I don't know about this." instead of guessing.
 Usage:
     python ask.py                  # interactive chat
     python ask.py "your question"  # one-shot question
+    streamlit run app.py           # browser UI (see app.py)
 """
 
 import os
@@ -33,6 +34,11 @@ MAX_SUBQUERIES = 3  # a multi-part question is split into at most this many sear
 MAX_CONTEXT_CHUNKS = 10  # total chunks handed to the LLM
 MAX_HISTORY_TURNS = 6  # remember the last N question/answer pairs
 UNKNOWN_ANSWER = "I don't know about this."
+
+# Words that end the chat rather than get answered. Without this the bot would
+# search the report for "exit" and honestly report that it isn't in there.
+EXIT_COMMANDS = {"exit", "quit", "q", ":q", "bye", "goodbye", "stop", "close"}
+EXIT_MESSAGE = "Exited from Chat"
 
 # Cheap signal that a question may ask for more than one thing. Deliberately
 # over-eager: a false positive costs one small LLM call, a false negative can
@@ -112,6 +118,14 @@ QUERY_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
+class SetupError(RuntimeError):
+    """Environment isn't ready to answer questions (no key, no vector store).
+
+    Raised rather than sys.exit-ed so a caller with a UI - app.py - can render
+    the message. The CLI turns it back into an exit in main().
+    """
+
+
 def _page_label(doc: Document) -> str:
     """Human-friendly 1-based page number from the metadata ingest.py writes."""
     page = doc.metadata.get("page")
@@ -128,6 +142,11 @@ def _format_context(docs: list[Document]) -> str:
     return "\n\n".join(blocks)
 
 
+def is_exit_command(text: str) -> bool:
+    """Whether the user is asking to leave rather than asking a question."""
+    return text.strip().rstrip("!.").lower() in EXIT_COMMANDS
+
+
 def _is_unknown(answer: str) -> bool:
     """True only when the whole answer is the fallback.
 
@@ -138,10 +157,27 @@ def _is_unknown(answer: str) -> bool:
     return cleaned == UNKNOWN_ANSWER.rstrip(".").lower()
 
 
-def _open_vectorstore() -> Chroma:
+def require_api_key() -> None:
+    """Load .env and fail early if there is still no key.
+
+    Called by every entry point that builds an OpenAI client - embeddings as
+    well as chat - because the client raises a much vaguer error of its own if
+    the key is missing.
+    """
+    load_dotenv()
+    if not os.getenv("OPENAI_API_KEY"):
+        raise SetupError(
+            "OPENAI_API_KEY not found.\n"
+            "Copy .env.example to .env and put your key in it."
+        )
+
+
+def open_vectorstore() -> Chroma:
     """Reconnect to the persisted Chroma DB, failing with a clear message."""
+    require_api_key()  # OpenAIEmbeddings below needs it
+
     if not Path(PERSIST_DIR).is_dir():
-        sys.exit(
+        raise SetupError(
             f"Vector store './{PERSIST_DIR}' not found.\n"
             "Build it first with:  python ingest.py"
         )
@@ -153,7 +189,7 @@ def _open_vectorstore() -> Chroma:
     )
 
     if not vectordb.get(limit=1).get("ids"):
-        sys.exit(
+        raise SetupError(
             f"Collection '{COLLECTION}' in './{PERSIST_DIR}' is empty.\n"
             "Re-run:  python ingest.py"
         )
@@ -163,18 +199,22 @@ def _open_vectorstore() -> Chroma:
 class PdfChatbot:
     """Retrieval-augmented chatbot over a single ingested PDF."""
 
-    def __init__(self, k: int = TOP_K):
-        load_dotenv()
-        if not os.getenv("OPENAI_API_KEY"):
-            sys.exit(
-                "OPENAI_API_KEY not found.\n"
-                "Copy .env.example to .env and put your key in it."
-            )
+    def __init__(self, k: int = TOP_K, vectordb: Chroma | None = None):
+        """Pass an already-open `vectordb` to skip reconnecting to Chroma.
+
+        app.py opens the store once per server and hands the same handle to
+        every browser session; the CLI leaves it None and opens its own.
+        """
+        require_api_key()
 
         self.k = k
-        self.vectordb = _open_vectorstore()
+        self.vectordb = vectordb if vectordb is not None else open_vectorstore()
         self.llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
         self.chat_history: list = []
+
+    def reset(self) -> None:
+        """Forget the conversation so far."""
+        self.chat_history.clear()
 
     def _needs_rewrite(self, question: str) -> bool:
         """Whether the extra query-rewrite LLM call is worth making.
@@ -278,7 +318,10 @@ def main() -> None:
     # raise UnicodeEncodeError on the first character it cannot map.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    bot = PdfChatbot()
+    try:
+        bot = PdfChatbot()
+    except SetupError as exc:
+        sys.exit(str(exc))
 
     # One-shot mode:  python ask.py "What were the 2025 revenues?"
     if len(sys.argv) > 1:
@@ -294,13 +337,13 @@ def main() -> None:
         try:
             question = input("| HUMAN | -> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nExited from Chat")
+            print(f"\n{EXIT_MESSAGE}")
             break
 
         if not question:
             continue
-        if question.lower() in {"exit", "quit", "q", ":q"}:
-            print("Exited from Chat")
+        if is_exit_command(question):
+            print(EXIT_MESSAGE)
             break
 
         try:

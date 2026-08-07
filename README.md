@@ -37,6 +37,22 @@ notepad .env
 
 ## Asking questions
 
+### Browser UI (easiest)
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Opens a chat window at <http://localhost:8501>. Each answer carries a
+**Sources** panel you can expand to read the exact chunks of the report it was
+written from — the quickest way to check an answer is really in the PDF.
+
+Type **exit** (or `quit`, `bye`, `q`) to end the conversation; a *Start a new
+chat* button appears. Closing the browser tab leaves the server running — stop
+it with `Ctrl+C` in the terminal.
+
+### Terminal
+
 ```powershell
 # Interactive chat (type 'exit' to quit)
 .\.venv\Scripts\python.exe ask.py
@@ -69,6 +85,11 @@ and stores them in a local Chroma database under `chroma_db/`.
 3. **Answering.** `gpt-4o-mini` (temperature 0) answers from those chunks only,
    citing page numbers. If nothing relevant is retrieved, the LLM isn't called
    at all — the fallback is returned directly.
+
+`app.py` — a Streamlit wrapper around the same `PdfChatbot`. No retrieval or
+prompting logic of its own; it opens the Chroma store once per server (shared
+by all browsers) and keeps one bot per browser session, so two people's
+follow-up questions don't resolve against each other's history.
 
 ### Units in financial tables
 
