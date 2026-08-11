@@ -111,6 +111,40 @@ Page citations are usually right but can drift to a neighbouring table when
 several similar tables are retrieved at once. The `SOURCES` list under each
 answer is the reliable place to check.
 
+### Known limitation: prior-year figures from reconciliation tables
+
+Asking for a comparative figure — *"and the year before that?"* — is the one
+question shape that fails. Measured over three settings, three repeats each:
+
+| `TOP_K`, `MAX_CONTEXT_CHUNKS` | correct | refused | **wrong** |
+| --- | --- | --- | --- |
+| 6, 10 (current) | 0 | 3 | **0** |
+| 10, 16 | 0 | 2 | **1** |
+| 14, 20 | 0 | 1 | **2** |
+
+More depth does not help, and it is actively harmful: it converts safe
+refusals into confident wrong answers. The current settings are the safest of
+the three, which is why they are unchanged.
+
+The cause is not retrieval depth. 2024 turnover (`14,853,681`) lives in five
+chunks, and one of them — a fragment of the adjustments reconciliation on
+page 91 — reads:
+
+```
+Turnover a 14,853,681 14,859,584 (5,903) 19,374,073 18,849,795 524,279
+```
+
+Six numeric columns whose header (`2024 | 2025`, each split into
+`Total | Adjusted | Adjustments`) landed in a *different* chunk. Given that
+fragment the model answers `€ 18.85 billion (18,849,795)` — the 2025 adjusted
+column, labelled as 2024. Prompt rule 6 tells it to look for a units header
+"several lines above the row", which chunking has removed.
+
+Retrieval steered to page 62 instead, where the clean two-column income
+statement keeps `Thousands of EUR Notes 2024 2025` inline with the row,
+answers correctly 3 times out of 3. So the fix is a chunking one — keep table
+headers with their rows at ingest — not a parameter one.
+
 ## Deploying it publicly
 
 The vector store under `chroma_db/` is committed, so a hosted deployment has
@@ -173,7 +207,8 @@ chunks must be embedded by the same model.
 | `PDF not found at: ...` | Only `ingest.py` needs the PDF. The report is not bundled; save your copy in this folder as `Umicore Annual Report 2025.pdf`. |
 | `Vector store './chroma_db' not found.` | The store is committed, so this means it was deleted — restore it with `git checkout chroma_db`, or rebuild via `ingest.py`. |
 | `Collection ... is empty.` | Re-run `ingest.py`. |
-| Answers are "I don't know" too often | Raise `TOP_K` / `MAX_CONTEXT_CHUNKS` in `ask.py`. |
+| `git status` shows `chroma_db/chroma.sqlite3` modified, and you changed nothing | Opening the store writes to internal sqlite pages, so simply running the app dirties the tracked file. The data is unchanged (same size, same contents). Discard it with `git checkout chroma_db`. |
+| Answers are "I don't know" too often | Raising `TOP_K` / `MAX_CONTEXT_CHUNKS` is the obvious lever and it was measured here — it did not help, and it turned safe refusals into confidently wrong figures. See *Known limitation* below before changing them. |
 | `chroma_db/` grows by ~9 MB per ingest | Expected. Chroma drops the old collection but leaves its UUID-named folder on disk. To reclaim: delete the whole `chroma_db/` folder and re-run `ingest.py`. |
 
 Note: `.env` holds a real API key. It's already in `.gitignore` — keep it that
