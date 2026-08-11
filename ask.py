@@ -29,9 +29,15 @@ PERSIST_DIR = "chroma_db"
 COLLECTION = "umicore-annual-report"
 EMBED_MODEL = "text-embedding-3-small"  # must match ingest.py
 CHAT_MODEL = "gpt-4o-mini"
-TOP_K = 6  # chunks fetched per search query
-MAX_SUBQUERIES = 3  # a multi-part question is split into at most this many searches
-MAX_CONTEXT_CHUNKS = 10  # total chunks handed to the LLM
+# Depth is safe to run this deep only because ingest.py carries each table's
+# column header onto the rows beneath it. On a store built without that, k=10
+# measurably produced wrong figures - more context meant more lookalike tables
+# to misread - and k=6 was the safest setting available. With headers attached,
+# k=10 answered every graded case correctly and k=6 missed facts that sit just
+# outside it. Re-measure before changing either number.
+TOP_K = 10  # chunks fetched per search query
+MAX_SUBQUERIES = 4  # search queries per question: two forms x up to two topics
+MAX_CONTEXT_CHUNKS = 16  # total chunks handed to the LLM
 MAX_HISTORY_TURNS = 6  # remember the last N question/answer pairs
 UNKNOWN_ANSWER = "I don't know about this."
 
@@ -91,8 +97,25 @@ SYSTEM_PROMPT = (
     "it is genuinely under a million.\n"
     "   If a table figure has no units header in the context, say its unit "
     "is unclear rather than assuming.\n"
-    "7. Cite the page number(s) you used, e.g. (page 12).\n"
-    "8. Be concise; use bullet points when listing several facts."
+    "7. TABLE HEADER LINES. A chunk may begin with '[page N table header: "
+    "...]'. That is the units and column layout of the table the rows below it "
+    "came from, restored because the extraction separated it from those rows. "
+    "Treat it as the header for those rows and nothing else.\n"
+    "8. COLUMNS AND YEARS. Map a figure to a year using the header before "
+    "reporting it. Where the header names years and then repeats sub-labels, "
+    "the figures in a row are grouped in the same order: with header "
+    "'2024 2025 | Total Adjusted Adjustments Total Adjusted Adjustments', the "
+    "row 'Turnover 14,853,681 14,859,584 (5,903) 19,374,073 18,849,795 "
+    "524,279' gives 2024 Total = 14,853,681 and 2025 Total = 19,374,073 - the "
+    "first three figures are 2024, the next three 2025.\n"
+    "   Prefer a plain statement table over an adjustments or reconciliation "
+    "table when both are present, and say which you used.\n"
+    "   If you cannot tell which column belongs to the year asked, say the "
+    "figure is ambiguous and name the candidates. NEVER pick a column because "
+    "it looks plausible - a figure reported against the wrong year is worse "
+    "than no figure.\n"
+    "9. Cite the page number(s) you used, e.g. (page 12).\n"
+    "10. Be concise; use bullet points when listing several facts."
 )
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
@@ -123,11 +146,18 @@ QUERY_PROMPT = ChatPromptTemplate.from_messages(
             "document database. You never answer it. Rules:\n"
             "- Each query must stand alone: resolve pronouns and references "
             "using the conversation.\n"
-            "- If the message asks several distinct things, output ONE query "
-            f"per line, at most {MAX_SUBQUERIES}. Otherwise output a single line.\n"
-            "- Keep the user's wording. Prefer a terse phrase over a sentence: "
-            '"2024 adjusted EBITDA" is a better query than "What was the '
-            'adjusted EBITDA in 2024?"\n'
+            "- For each distinct thing asked, output TWO lines: a terse "
+            "keyword phrase, then the same thing as a full standalone "
+            'question. For "and in 2024?" following a question about adjusted '
+            'EBITDA, that is:\n'
+            "    2024 adjusted EBITDA\n"
+            "    What was the adjusted EBITDA in 2024?\n"
+            "  Both are needed: the terse phrase matches figures in table "
+            "rows, the full question matches figures stated in prose. Emitting "
+            "only one form loses whichever the answer happens to live in.\n"
+            f"- At most {MAX_SUBQUERIES} lines. If more than two distinct "
+            "things are asked, give each one a terse phrase instead.\n"
+            "- Keep the user's wording.\n"
             "- Never state a fact, figure or page number, even if you believe "
             "you know it. A query containing an answer you invented sends the "
             "search to the wrong part of the document.\n"

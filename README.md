@@ -111,39 +111,57 @@ Page citations are usually right but can drift to a neighbouring table when
 several similar tables are retrieved at once. The `SOURCES` list under each
 answer is the reliable place to check.
 
-### Known limitation: prior-year figures from reconciliation tables
+### Table headers are carried onto their rows
 
-Asking for a comparative figure — *"and the year before that?"* — is the one
-question shape that fails. Measured over three settings, three repeats each:
-
-| `TOP_K`, `MAX_CONTEXT_CHUNKS` | correct | refused | **wrong** |
-| --- | --- | --- | --- |
-| 6, 10 (current) | 0 | 3 | **0** |
-| 10, 16 | 0 | 2 | **1** |
-| 14, 20 | 0 | 1 | **2** |
-
-More depth does not help, and it is actively harmful: it converts safe
-refusals into confident wrong answers. The current settings are the safest of
-the three, which is why they are unchanged.
-
-The cause is not retrieval depth. 2024 turnover (`14,853,681`) lives in five
-chunks, and one of them — a fragment of the adjustments reconciliation on
-page 91 — reads:
+A statement page prints its units and year columns once, then many rows
+beneath. Splitting at 800 characters puts most rows in chunks that no longer
+contain the header. On page 91 the header sits at offset ~1100 and the Turnover
+row at ~1874, so the row arrived as six bare numbers:
 
 ```
 Turnover a 14,853,681 14,859,584 (5,903) 19,374,073 18,849,795 524,279
 ```
 
-Six numeric columns whose header (`2024 | 2025`, each split into
-`Total | Adjusted | Adjustments`) landed in a *different* chunk. Given that
-fragment the model answers `€ 18.85 billion (18,849,795)` — the 2025 adjusted
-column, labelled as 2024. Prompt rule 6 tells it to look for a units header
-"several lines above the row", which chunking has removed.
+Asked for 2024 turnover, the model answered `€ 18.85 billion (18,849,795)` —
+the *2025 adjusted* column, labelled as 2024. Confidently, and every time.
 
-Retrieval steered to page 62 instead, where the clean two-column income
-statement keeps `Thousands of EUR Notes 2024 2025` inline with the row,
-answers correctly 3 times out of 3. So the fix is a chunking one — keep table
-headers with their rows at ingest — not a parameter one.
+`ingest.py` now finds every table header on a page, records its offset, and
+prefixes each chunk with the header that *precedes* it:
+
+```
+[page 91 table header: Adjustments included in the result | 2024 2025 |
+ Thousands of EUR Notes Total Adjusted Adjustments Total Adjusted Adjustments]
+Turnover a 14,853,681 14,859,584 (5,903) ...
+```
+
+Nearest-preceding matters: page 91 carries R&D expenditure *above* the
+reconciliation, and captioning a six-column row with that two-column header
+would be worse than no caption. Prompt rules 7 and 8 tell the model to read
+that line as the header, how to map grouped columns to years, and to declare a
+figure ambiguous rather than pick a plausible column.
+
+Measured after the change, three repeats per case:
+
+| `TOP_K`, `MAX_CONTEXT_CHUNKS` | correct | refused | **wrong** |
+| --- | --- | --- | --- |
+| 6, 10 | 21 | 3 | **0** |
+| **10, 16 (current)** | **24** | **0** | **0** |
+| 14, 20 | 24 | 0 | **0** |
+
+This reverses an earlier finding recorded here. On the store built *without*
+header propagation, raising `TOP_K` to 10 produced wrong figures and 6 was the
+safest setting. With headers attached, the wrong-column failure is gone at
+every depth, and 6 is merely shallow — it missed free cash flow, whose chunk
+ranks 11th. Hence 10/16. Re-measure before changing either number.
+
+### What this does not cover
+
+Header detection keys on a `Thousands|Millions|Billions of EUR` line. Of 219
+pages, 57 get a header carried; **25 more look tabular but get none**, 10 of
+those because they tabulate percentages, tonnes or headcount instead of euros.
+Rows on those pages can still lose their column labels. The graded cases all
+concern the euro statement tables, so treat non-euro tables as unverified and
+check the `SOURCES` panel.
 
 ## Deploying it publicly
 
@@ -188,9 +206,9 @@ Constants at the top of `ask.py`:
 
 | Name | Default | Purpose |
 | --- | --- | --- |
-| `TOP_K` | 6 | Chunks fetched per search query |
+| `TOP_K` | 10 | Chunks fetched per search query |
 | `MAX_SUBQUERIES` | 3 | Max searches for one multi-part question |
-| `MAX_CONTEXT_CHUNKS` | 10 | Total chunks sent to the LLM |
+| `MAX_CONTEXT_CHUNKS` | 16 | Total chunks sent to the LLM |
 | `MAX_HISTORY_TURNS` | 6 | Q&A pairs kept as conversation memory |
 | `CHAT_MODEL` | `gpt-4o-mini` | Answering model |
 
@@ -208,7 +226,7 @@ chunks must be embedded by the same model.
 | `Vector store './chroma_db' not found.` | The store is committed, so this means it was deleted — restore it with `git checkout chroma_db`, or rebuild via `ingest.py`. |
 | `Collection ... is empty.` | Re-run `ingest.py`. |
 | `git status` shows `chroma_db/chroma.sqlite3` modified, and you changed nothing | Opening the store writes to internal sqlite pages, so simply running the app dirties the tracked file. The data is unchanged (same size, same contents). Discard it with `git checkout chroma_db`. |
-| Answers are "I don't know" too often | Raising `TOP_K` / `MAX_CONTEXT_CHUNKS` is the obvious lever and it was measured here — it did not help, and it turned safe refusals into confidently wrong figures. See *Known limitation* below before changing them. |
+| Answers are "I don't know" too often | Raise `TOP_K` / `MAX_CONTEXT_CHUNKS` in `ask.py` — but re-measure afterwards. Depth is only safe because table headers travel with their rows; on a store built without that, raising it produced confidently wrong figures. See *Table headers are carried onto their rows*. |
 | `chroma_db/` grows by ~9 MB per ingest | Expected. Chroma drops the old collection but leaves its UUID-named folder on disk. To reclaim: delete the whole `chroma_db/` folder and re-run `ingest.py`. |
 
 Note: `.env` holds a real API key. It's already in `.gitignore` — keep it that
