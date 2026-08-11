@@ -43,8 +43,9 @@ so supply your own copy first:
 .\.venv\Scripts\python.exe ingest.py   # ~1-2 min, costs a few cents
 ```
 
-`ingest.py` wipes and rebuilds the collection each time, so re-running never
-duplicates data. Committing the result replaces roughly 28 MB.
+`ingest.py` deletes the store directory and rebuilds it each time, so
+re-running never duplicates data and never accumulates dead segment folders.
+Committing the result replaces roughly 28 MB.
 
 ## Asking questions
 
@@ -250,7 +251,7 @@ chunks must be embedded by the same model.
 | `Collection ... is empty.` | Re-run `ingest.py`. |
 | `git status` shows `chroma_db/chroma.sqlite3` modified, and you changed nothing | Opening the store writes to internal sqlite pages, so simply running the app dirties the tracked file. The data is unchanged (same size, same contents). Discard it with `git checkout chroma_db`. |
 | Answers are "I don't know" too often | Raise `TOP_K` / `MAX_CONTEXT_CHUNKS` in `ask.py` — but re-measure afterwards. Depth is only safe because table headers travel with their rows; on a store built without that, raising it produced confidently wrong figures. See *Table headers are carried onto their rows*. |
-| `chroma_db/` grows by ~9 MB per ingest | Expected. Chroma drops the old collection but leaves its UUID-named folder on disk. To reclaim: delete the whole `chroma_db/` folder and re-run `ingest.py`. |
+| `chroma_db/` seems to be growing | It no longer should. `delete_collection()` used to leave each run's UUID-named segment folder on disk and its sqlite pages unreclaimed, which grew a 28 MB store to 51 MB over three ingests. `ingest.py` now deletes the store directory before rebuilding, so a rebuild starts from nothing. It refuses to delete a directory without a `chroma.sqlite3` in it, in case `persist_dir` is mistyped. |
 
 Note: `.env` holds a real API key. It's already in `.gitignore` — keep it that
 way, and don't commit `chroma_db/` either (it's ignored too).

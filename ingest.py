@@ -3,6 +3,7 @@
 
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -183,6 +184,31 @@ def load_pdf_pages(pdf_file: Path) -> list[Document]:
     return pages
 
 
+def reset_store(persist_path: Path) -> None:
+    """Delete the whole store directory so a rebuild starts from nothing.
+
+    delete_collection() alone is not enough: it drops the collection but leaves
+    its UUID-named segment folder on disk and leaves the freed sqlite pages
+    unreclaimed. Three ingests had grown a 28 MB store to 51 MB, two thirds of
+    the segment folders dead - and since the store is committed, every byte of
+    that ships to anyone who clones or deploys it.
+
+    Guarded on chroma.sqlite3 being present, so a mistyped persist_dir removes
+    nothing that isn't a Chroma store.
+    """
+    if not persist_path.exists():
+        return
+
+    if not (persist_path / "chroma.sqlite3").exists():
+        raise RuntimeError(
+            f"'{persist_path}' exists but is not a Chroma store "
+            "(no chroma.sqlite3). Refusing to delete it - check persist_dir."
+        )
+
+    shutil.rmtree(persist_path)
+    print(f"   Removed the previous store at ./{persist_path}")
+
+
 def ingest_pdf_to_chroma(
     pdf_path: str = "Umicore Annual Report 2025.pdf",
     persist_dir: str = "chroma_db",
@@ -207,6 +233,7 @@ def ingest_pdf_to_chroma(
         raise FileNotFoundError(f"PDF not found at: {pdf_file.resolve()}")
 
     persist_path = Path(persist_dir)
+    reset_store(persist_path)
     persist_path.mkdir(parents=True, exist_ok=True)
 
     print("1) Loading PDF...")
@@ -233,14 +260,6 @@ def ingest_pdf_to_chroma(
 
     print("3) Creating embeddings and building vector store...")
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-    # Drop any previous run first - Chroma.from_documents appends, so
-    # re-ingesting without this would store every chunk twice.
-    Chroma(
-        embedding_function=embeddings,
-        persist_directory=str(persist_path),
-        collection_name=collection_name,
-    ).delete_collection()
 
     vectordb = Chroma.from_documents(
         documents=chunks,
