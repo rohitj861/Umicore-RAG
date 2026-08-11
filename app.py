@@ -9,9 +9,22 @@ Usage:
     streamlit run app.py
 """
 
+import hmac
 import os
+import sys
 
 import streamlit as st
+
+# chromadb needs sqlite >= 3.35, and some of the Linux images hosting providers
+# run still ship an older one. pysqlite3-binary (installed on Linux only - see
+# requirements.txt) is a current build of the same module. The swap has to
+# happen before anything imports chromadb, which is why it sits here above the
+# ask import instead of inside a function.
+try:
+    __import__("pysqlite3")
+    sys.modules["sqlite3"] = sys.modules["pysqlite3"]
+except ModuleNotFoundError:
+    pass  # local Windows/macOS run: the stdlib sqlite3 is new enough
 
 from ask import (
     CHAT_MODEL,
@@ -41,6 +54,51 @@ st.set_page_config(
     page_icon="📄",
     layout="centered",
 )
+
+
+def load_hosted_secrets() -> None:
+    """Bridge a hosting provider's secrets into the environment.
+
+    ask.py reads its key with os.getenv, which .env satisfies locally. A hosted
+    deployment has no .env - Streamlit serves the values from its dashboard
+    through st.secrets - so copy them across before anything constructs an
+    OpenAI client. st.secrets is empty on a local run, making this a no-op
+    there; where both exist, st.secrets wins, because .env is only read later
+    and load_dotenv() does not overwrite a variable that is already set.
+    """
+    for name in ("OPENAI_API_KEY", "APP_PASSWORD"):
+        if os.getenv(name):
+            continue
+        try:
+            value = st.secrets[name]
+        except Exception:  # no secrets file, or this key isn't in it
+            continue
+        os.environ[name] = str(value)
+
+
+def check_password() -> bool:
+    """Gate the app when APP_PASSWORD is set.
+
+    A public deployment answers questions on the owner's API key, so leaving it
+    open is an invitation to spend it. Without the variable - every local run,
+    and any deployment that doesn't want a gate - the app is open as before.
+    """
+    expected = os.getenv("APP_PASSWORD")
+    if not expected or st.session_state.get("authenticated"):
+        return True
+
+    with st.form("login"):
+        entered = st.text_input("Password", type="password")
+        if st.form_submit_button("Enter"):
+            # Compared on bytes: hmac.compare_digest rejects str containing
+            # anything outside ASCII, which a chosen password may well be.
+            if hmac.compare_digest(entered.encode(), expected.encode()):
+                st.session_state.authenticated = True
+                st.rerun()
+            st.error("Wrong password.")
+
+    st.caption("This deployment is password-protected.")
+    return False
 
 
 @st.cache_resource(show_spinner="Opening the vector store...")
@@ -139,6 +197,10 @@ def answer(question: str) -> None:
     )
 
 
+# Must run before anything reads the key or the password.
+load_hosted_secrets()
+
+
 # --- Sidebar -----------------------------------------------------------------
 
 with st.sidebar:
@@ -173,6 +235,11 @@ st.caption(
     "Ask anything about the report. Every answer cites its pages. "
     "Type **exit** when you're done."
 )
+
+if not check_password():
+    # Nothing below this point should run for an unauthenticated visitor - in
+    # particular not get_bot(), which would open the store and cost money.
+    st.stop()
 
 try:
     get_bot()

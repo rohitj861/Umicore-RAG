@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Streamlit secrets, if ever mirrored locally. The real values belong in the
+# hosting provider's dashboard; only the template is tracked.
+.streamlit/secrets.toml
+
 # Python virtual environment
 .venv/
 venv/
