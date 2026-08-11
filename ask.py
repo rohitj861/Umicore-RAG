@@ -40,10 +40,26 @@ UNKNOWN_ANSWER = "I don't know about this."
 EXIT_COMMANDS = {"exit", "quit", "q", ":q", "bye", "goodbye", "stop", "close"}
 EXIT_MESSAGE = "Exited from Chat"
 
+# Substrings that mark a key as never having been filled in. Checked instead of
+# requiring an "sk-" prefix: rejecting an unfamiliar but valid key format would
+# break a working setup, which is worse than the vague error this replaces.
+PLACEHOLDER_HINTS = ("your-openai-api-key", "your_key_here", "api-key-here", "xxx")
+
 # Cheap signal that a question may ask for more than one thing. Deliberately
 # over-eager: a false positive costs one small LLM call, a false negative can
 # cost a correct answer.
 MULTIPART_HINT = re.compile(r"\b(and|also|as well as|plus|besides|versus|vs)\b", re.I)
+
+# Removes list markers the rewriter may prefix to each query ("1. ", "- ").
+# Matching the marker shape matters: lstrip() over a digit set also eats a
+# query that legitimately begins with a number, turning "2024 turnover" into
+# "turnover" and silently dropping the year the follow-up was about.
+LIST_MARKER = re.compile(r"^\s*(?:[-*•]|\d{1,2}[.)])\s+")
+
+# How much of each past message the rewriter sees. Enough to resolve "that
+# year" or "the same segment"; short enough that a long answer can't crowd out
+# the instruction or be copied back wholesale.
+HISTORY_EXCERPT = 400
 
 SYSTEM_PROMPT = (
     "You answer questions about the Umicore Annual Report 2025 using ONLY the "
@@ -103,17 +119,35 @@ QUERY_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Rewrite the user's latest message as search queries for a "
-            "document database. Rules:\n"
+            "You rewrite the user's latest message into search queries for a "
+            "document database. You never answer it. Rules:\n"
             "- Each query must stand alone: resolve pronouns and references "
-            "using the chat history.\n"
+            "using the conversation.\n"
             "- If the message asks several distinct things, output ONE query "
             f"per line, at most {MAX_SUBQUERIES}. Otherwise output a single line.\n"
-            "- Keep the original wording where possible. Do NOT answer the "
-            "question. Output only the queries, no numbering or bullets.",
+            "- Keep the user's wording. Prefer a terse phrase over a sentence: "
+            '"2024 adjusted EBITDA" is a better query than "What was the '
+            'adjusted EBITDA in 2024?"\n'
+            "- Never state a fact, figure or page number, even if you believe "
+            "you know it. A query containing an answer you invented sends the "
+            "search to the wrong part of the document.\n"
+            "- Output only the queries: no numbering, bullets or commentary.",
         ),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
+        # The conversation goes in as *text*, not as replayed messages. With a
+        # MessagesPlaceholder here the model saw its own earlier answers in the
+        # assistant role, matched that pattern and answered the follow-up
+        # instead of rewriting it - putting a figure it had invented into the
+        # search query. As quoted text there is no turn-taking pattern to
+        # continue, and the instruction stays next to the input.
+        (
+            "human",
+            "Conversation so far, for resolving references only:\n"
+            "-----\n"
+            "{history}\n"
+            "-----\n\n"
+            "Latest message: {input}\n\n"
+            "Search queries:",
+        ),
     ]
 )
 
@@ -142,6 +176,25 @@ def _format_context(docs: list[Document]) -> str:
     return "\n\n".join(blocks)
 
 
+def _format_history(messages: list) -> str:
+    """The conversation as plain text for the query rewriter.
+
+    Each message is truncated: the rewriter only needs enough to resolve a
+    reference, and a full financial answer is mostly figures it must not reuse.
+    """
+    if not messages:
+        return "(no earlier messages)"
+
+    speakers = {"human": "User", "ai": "Assistant"}
+    lines = []
+    for message in messages:
+        content = str(message.content).strip().replace("\n", " ")
+        if len(content) > HISTORY_EXCERPT:
+            content = content[:HISTORY_EXCERPT] + " [...]"
+        lines.append(f"{speakers.get(message.type, message.type)}: {content}")
+    return "\n".join(lines)
+
+
 def is_exit_command(text: str) -> bool:
     """Whether the user is asking to leave rather than asking a question."""
     return text.strip().rstrip("!.").lower() in EXIT_COMMANDS
@@ -158,18 +211,57 @@ def _is_unknown(answer: str) -> bool:
 
 
 def require_api_key() -> None:
-    """Load .env and fail early if there is still no key.
+    """Load .env and fail early if there is still no usable key.
 
     Called by every entry point that builds an OpenAI client - embeddings as
     well as chat - because the client raises a much vaguer error of its own if
     the key is missing.
+
+    Only obvious non-keys are caught here. A wrong-but-plausible key can only
+    be judged by OpenAI, and nothing in setup calls the API, so that case
+    surfaces at the first question - see explain_api_error.
     """
     load_dotenv()
-    if not os.getenv("OPENAI_API_KEY"):
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+
+    if not key:
         raise SetupError(
             "OPENAI_API_KEY not found.\n"
             "Copy .env.example to .env and put your key in it."
         )
+
+    if any(hint in key.lower() for hint in PLACEHOLDER_HINTS):
+        raise SetupError(
+            f"OPENAI_API_KEY is still the placeholder ('{key[:28]}...').\n"
+            "Replace it in .env with your real key."
+        )
+
+
+def explain_api_error(exc: Exception) -> str:
+    """Turn an OpenAI client error into something the user can act on.
+
+    Matched on class name rather than by importing openai: the SDK is only a
+    transitive dependency here, and its exception paths have moved between
+    majors. An unrecognised error is passed through verbatim.
+    """
+    name = type(exc).__name__
+    detail = str(exc)
+
+    if name == "AuthenticationError" or "invalid_api_key" in detail:
+        return (
+            "OpenAI rejected the API key in .env. Check it is complete, "
+            "current, and has no quotes or trailing spaces around it."
+        )
+    if name == "PermissionDeniedError":
+        return "That key is not permitted to use this model."
+    if name == "RateLimitError" or "insufficient_quota" in detail:
+        return (
+            "OpenAI refused the request - rate limit or exhausted quota. "
+            "Check the billing and limits on your OpenAI account."
+        )
+    if name in {"APIConnectionError", "APITimeoutError"}:
+        return "Could not reach OpenAI. Check your network connection."
+    return f"Could not answer that: {exc}"
 
 
 def open_vectorstore() -> Chroma:
@@ -233,10 +325,10 @@ class PdfChatbot:
             return [question]
 
         response = (QUERY_PROMPT | self.llm).invoke(
-            {"chat_history": self.chat_history, "input": question}
+            {"history": _format_history(self.chat_history), "input": question}
         )
         queries = [
-            line.strip().lstrip("-*•0123456789. ").strip()
+            LIST_MARKER.sub("", line).strip()
             for line in response.content.splitlines()
             if line.strip()
         ]
@@ -349,7 +441,7 @@ def main() -> None:
         try:
             print_answer(*bot.ask(question))
         except Exception as exc:  # keep the chat alive on API/network hiccups
-            print(f"\n[error] Could not answer that: {exc}\n")
+            print(f"\n[error] {explain_api_error(exc)}\n")
 
 
 if __name__ == "__main__":

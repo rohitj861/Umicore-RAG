@@ -22,6 +22,7 @@ from ask import (
     PdfChatbot,
     SetupError,
     _page_label,
+    explain_api_error,
     is_exit_command,
     open_vectorstore,
 )
@@ -129,7 +130,7 @@ def answer(question: str) -> None:
             try:
                 text, sources = get_bot().ask(question)
             except Exception as exc:  # API/network hiccup - keep the chat alive
-                text, sources = f"Could not answer that: {exc}", []
+                text, sources = explain_api_error(exc), []
         st.markdown(text)
         render_sources(sources)
 
@@ -183,28 +184,40 @@ except SetupError as exc:
 if "messages" not in st.session_state:
     start_new_chat()
 
+# Read the input before drawing anything that depends on the transcript.
+# st.chat_input is pinned to the bottom of the page wherever it is called, so
+# reading it here doesn't move it - but it does let the starter questions below
+# see the message that just arrived and hide themselves, instead of sitting
+# above the first answer until the next rerun.
+if st.session_state.ended:
+    # The chat is closed: no more questions until the user asks for a new one.
+    st.chat_input("Chat ended", disabled=True)
+    pending = None
+else:
+    pending = st.chat_input("Ask a question about the report...")
+
 # Replay the conversation so far (Streamlit reruns the script on every input).
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         render_sources(message.get("sources", []))
 
-# Starter questions, shown only on an empty chat.
-if not st.session_state.messages:
+# Starter questions, shown only while the chat is genuinely empty.
+if not st.session_state.messages and not pending:
     st.write("**Try one of these:**")
     for i, example in enumerate(EXAMPLE_QUESTIONS):
         if st.button(example, key=f"example_{i}", use_container_width=True):
             answer(example)
             st.rerun()
 
-if st.session_state.ended:
-    # The chat is closed: no more questions until the user asks for a new one.
-    st.chat_input("Chat ended", disabled=True)
-    if st.button("Start a new chat", type="primary", use_container_width=True):
-        start_new_chat()
-        st.rerun()
-elif question := st.chat_input("Ask a question about the report..."):
-    answer(question)
+if pending:
+    answer(pending)
     if st.session_state.ended:
         # end_chat() only appended to the log - rerun to draw the closed state.
         st.rerun()
+
+if st.session_state.ended and st.button(
+    "Start a new chat", type="primary", use_container_width=True
+):
+    start_new_chat()
+    st.rerun()

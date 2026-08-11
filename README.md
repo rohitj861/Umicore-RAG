@@ -16,7 +16,7 @@ SOURCES:
 ## Setup (once)
 
 ```powershell
-cd "C:\Users\Rohit Joshi\OneDrive\Desktop\Rohit_Prima\RAG Usecase\rag-Umicore"
+cd "C:\Umicore RAG\rag-umicore"
 
 # 1. Virtual environment + dependencies
 py -3.14 -m venv .venv
