@@ -20,7 +20,28 @@ from langchain_chroma import Chroma
 # rows in chunks that no longer contain the header: on page 91 the header sits
 # at offset ~1100 and the Turnover row at ~1874, so the row-bearing chunk
 # arrives with six bare numbers and nothing to say which year each belongs to.
-UNITS_LINE = re.compile(r"(?:Thousands|Millions|Billions) of EUR", re.I)
+UNITS_LINE = re.compile(
+    r"(?:Thousands|Millions|Billions) of EUR"  # statement tables
+    r"|\(in (?:million|thousand|billion)s? ?€\)"  # segment key figures
+    r"|\bin %",
+    re.I,
+)
+
+# A run of two or more years separated by nothing but whitespace is a column
+# header: "2024 2025", "(in million €) 2024 2025 2024 2025", "Company
+# performance 2021 2022 2023 2024 2025". Requiring whitespace-only separators
+# is what keeps prose out - "between 2024 and 2025" does not match.
+YEAR_COLUMNS = re.compile(r"\b(?:19|20)\d{2}(?:\s+(?:19|20)\d{2})+\b")
+
+# Thousands-separated numbers mark a data row, not a header. Without this,
+# "Baseline value (t) (baseline year) 791,816 (2019) 6,816,941 (2019)" reads as
+# a year header because it mentions 2019 twice.
+DATA_NUMBER = re.compile(r"\d{1,3},\d{3}")
+
+# Used to tell a header band apart from a data row: years are fine in a header,
+# three or more other figures are not.
+NUMERIC_TOKEN = re.compile(r"-?\d[\d,.]*%?")
+YEAR = re.compile(r"(?:19|20)\d{2}")
 
 # Lines above the units line that are worth carrying with it: a bare year row
 # ("2024 2025") and a short table title. Longer lines are body prose, not
@@ -34,17 +55,39 @@ RUNNING_HEADER = re.compile(r"Umicore Annual Report\s+\d{4}", re.I)
 
 
 def _is_header_line(line: str) -> bool:
-    """Whether a line above the units line belongs to the header.
+    """Whether a line above the header line belongs to the header too.
 
-    Wanted: a bare year row ("2024 2025") or a short table title
-    ("Adjustments included in the result"). Not wanted: body prose, which is
-    what a trailing full stop reliably indicates on these pages.
+    Wanted: a bare year row ("2024 2025"), a column band ("% INTEREST IN
+    % INTEREST IN", "Key figures H2 H2") or a short table title. Not wanted:
+    body prose - a trailing full stop marks that reliably here - and not a data
+    row, which is what several non-year numbers mean. Without the numeric test,
+    page 52 captions its table with the row "% change versus previous year
+    7.5% 5.6% 10.2% -0.9% 4.8%".
     """
+    if not line or len(line) > MAX_HEADER_LINE:
+        return False
+    if line.endswith(".") or RUNNING_HEADER.search(line):
+        return False
+
+    figures = [n for n in NUMERIC_TOKEN.findall(line) if not YEAR.fullmatch(n)]
+    return len(figures) < 3
+
+
+def _is_units_or_year_header(line: str) -> bool:
+    """Whether this line is the header row of a table.
+
+    Two ways to qualify: it names the units, or it is a run of year columns.
+    The year route needs the data-row guard; the units route deliberately does
+    not, because extraction sometimes merges a units header with its first row
+    and that line is still the header.
+    """
+    if UNITS_LINE.search(line):
+        return True
     return (
-        bool(line)
-        and len(line) <= MAX_HEADER_LINE
+        bool(YEAR_COLUMNS.search(line))
+        and not DATA_NUMBER.search(line)
+        and len(line) <= 130
         and not line.endswith(".")
-        and not RUNNING_HEADER.search(line)
     )
 
 
@@ -63,7 +106,7 @@ def table_headers(page_text: str) -> list[tuple[int, str]]:
     stripped = [line.strip() for line in lines]
 
     for i, line in enumerate(lines):
-        if UNITS_LINE.search(stripped[i]):
+        if _is_units_or_year_header(stripped[i]):
             parts = [stripped[i]]
             for previous in reversed(stripped[max(0, i - 2) : i]):
                 if _is_header_line(previous):

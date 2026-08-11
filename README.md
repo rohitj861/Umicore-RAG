@@ -140,6 +140,11 @@ would be worse than no caption. Prompt rules 7 and 8 tell the model to read
 that line as the header, how to map grouped columns to years, and to declare a
 figure ambiguous rather than pick a plausible column.
 
+Measured over three runs of a nine-turn conversation at the shipped settings:
+**27 of 27 correct, none wrong** — the comparative figures, the prose figure,
+the reconciliation column, both four-column segment cases, the percentage
+series, and the unanswerable question all held.
+
 Measured after the change, three repeats per case:
 
 | `TOP_K`, `MAX_CONTEXT_CHUNKS` | correct | refused | **wrong** |
@@ -154,14 +159,32 @@ safest setting. With headers attached, the wrong-column failure is gone at
 every depth, and 6 is merely shallow — it missed free cash flow, whose chunk
 ranks 11th. Hence 10/16. Re-measure before changing either number.
 
+A header line qualifies two ways: it names units (`Thousands of EUR`,
+`(in million €)`, `in %`) or it is a run of years separated by nothing but
+whitespace (`2024 2025`, `Company performance 2021 2022 2023 2024 2025`).
+Whitespace-only separators are what keep prose out — *"between 2024 and 2025"*
+does not match. Two guards stop data rows being mistaken for headers: a
+thousands-separated number disqualifies the year route, and a candidate line
+above the header is dropped if it carries three or more non-year figures.
+Without the second, page 52 captioned its table with the row
+`% change versus previous year 7.5% 5.6% 10.2% -0.9% 4.8%`.
+
+Coverage: **80 of 219 pages** carry a header onto 320 chunks. Three pages
+(16, 53, 54) mention a year pair without being tables.
+
+The riskiest layout is the segment key figures on pages 18–24, which print four
+columns per row — `Key figures H2 H2` over `(in million €) 2024 2025 2024 2025`,
+a half-year pair then a full-year pair. Graded on Catalysis full-year 2025
+turnover (`4,482`, against the traps `2,178` for H2 and `4,346` for 2024) and on
+ROCE 2025 (`15.7%`, trap `12.3%`), three repeats each, all correct.
+
 ### What this does not cover
 
-Header detection keys on a `Thousands|Millions|Billions of EUR` line. Of 219
-pages, 57 get a header carried; **25 more look tabular but get none**, 10 of
-those because they tabulate percentages, tonnes or headcount instead of euros.
-Rows on those pages can still lose their column labels. The graded cases all
-concern the euro statement tables, so treat non-euro tables as unverified and
-check the `SOURCES` panel.
+Verified question shapes are the ones above: comparative statement figures,
+prose figures, a reconciliation column, four-column segment tables, a
+percentage series, and a question the report cannot answer. That is not
+coverage of a 220-page report, and the model is not deterministic — treat the
+`SOURCES` panel as the check on any figure that matters.
 
 ## Deploying it publicly
 
