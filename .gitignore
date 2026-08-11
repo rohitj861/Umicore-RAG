@@ -11,8 +11,12 @@
 .venv/
 venv/
 
-# Generated vector store
-chroma_db/
+# The generated vector store IS tracked, deliberately. A hosted deployment
+# cannot run ingest.py - it has no PDF and no reason to spend the API credits
+# on every cold start - so the store ships with the repo instead. Rebuilding it
+# locally and committing the result replaces ~28 MB each time; if that history
+# becomes a nuisance, move the store to a hosted vector DB and ignore it again.
+# chroma_db/
 
 # Source documents. The report is Umicore's to distribute, not ours, so it
 # is kept out of the repo; drop your own copy in this folder to run ingest.

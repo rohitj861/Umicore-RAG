@@ -27,13 +27,24 @@ py -3.14 -m venv .venv
 Copy-Item .env.example .env
 notepad .env
 
-# 3. The report is not in this repo. Download it from Umicore and save it in
-#    this folder as exactly: Umicore Annual Report 2025.pdf
-#    (Any PDF works if you change pdf_path in ingest.py.)
-
-# 4. Read the PDF into the vector database (~1-2 min, costs a few cents)
-.\.venv\Scripts\python.exe ingest.py
+# That is all. The vector store under chroma_db/ is committed, so there is
+# nothing to ingest and no PDF to download - go straight to asking questions.
 ```
+
+### Rebuilding the store
+
+Only needed to point the project at a different PDF, or to change
+`EMBED_MODEL`. The report is not in this repo — it is Umicore's to distribute —
+so supply your own copy first:
+
+```powershell
+# Save the report in this folder as exactly: Umicore Annual Report 2025.pdf
+# (Any PDF works if you change pdf_path in ingest.py.)
+.\.venv\Scripts\python.exe ingest.py   # ~1-2 min, costs a few cents
+```
+
+`ingest.py` wipes and rebuilds the collection each time, so re-running never
+duplicates data. Committing the result replaces roughly 28 MB.
 
 ## Asking questions
 
@@ -63,9 +74,6 @@ it with `Ctrl+C` in the terminal.
 
 Follow-up questions work — the bot remembers the last 6 exchanges, so
 "and what about the year before that?" resolves correctly.
-
-You only re-run `ingest.py` if the PDF changes. It wipes and rebuilds the
-collection each time, so re-running never duplicates data.
 
 ## How it works
 
@@ -103,6 +111,43 @@ Page citations are usually right but can drift to a neighbouring table when
 several similar tables are retrieved at once. The `SOURCES` list under each
 answer is the reliable place to check.
 
+## Deploying it publicly
+
+The vector store under `chroma_db/` is committed, so a hosted deployment has
+everything it needs: it never runs `ingest.py`, never needs the PDF, and spends
+nothing on embeddings at boot. Note what that means — the store holds the
+report's extracted text alongside the vectors, so this repository carries that
+text even though the PDF itself is not here.
+
+On Streamlit Community Cloud:
+
+1. **New app** → point it at this repo, branch `main`, file `app.py`.
+2. **Advanced settings → Python version.** This project is developed on 3.14;
+   if that isn't offered, pick 3.13. Every pin in `requirements.txt` has a
+   cp313 wheel.
+3. **Secrets.** Paste the contents of `.streamlit/secrets.toml.example`, with
+   your real key. `app.py` copies these into the environment at startup, which
+   is where `ask.py` looks for them — there is no `.env` in a deployment.
+4. Deploy. First boot takes a few minutes while dependencies install.
+
+### Before you make the URL public
+
+Every answer spends **your** OpenAI credits, and the app has no rate limiting.
+
+- **Set a hard monthly spend cap** in the OpenAI billing dashboard. It is the
+  only limit that cannot be bypassed, and the only one worth relying on.
+- **Set `APP_PASSWORD`** in the secrets to put a password in front of the app.
+  The gate runs before the vector store is opened, so an unauthenticated
+  visitor cannot trigger any API call. Leave it unset and the app is open to
+  anyone with the link.
+
+### If chromadb fails to import on first deploy
+
+Some hosting images ship an sqlite older than the 3.35 chromadb requires.
+`requirements.txt` already installs `pysqlite3-binary` on Linux and `app.py`
+swaps it in for the stdlib module before chromadb loads, so this should be
+handled — but that swap is what the traceback will be about if it isn't.
+
 ## Configuration
 
 Constants at the top of `ask.py`:
@@ -123,8 +168,10 @@ chunks must be embedded by the same model.
 | Message | Fix |
 | --- | --- |
 | `OPENAI_API_KEY not found.` | Create `.env` with your key. Watch for Notepad saving it as `.env.txt`. |
-| `PDF not found at: ...` | The report is not bundled. Save your copy in this folder as `Umicore Annual Report 2025.pdf`. |
-| `Vector store './chroma_db' not found.` | Run `ingest.py` first. |
+| `OPENAI_API_KEY is still the placeholder` | `.env` still holds the example value. Put your real key in it. |
+| `OpenAI rejected the API key in .env.` | The key reached OpenAI and was refused — check it is complete and current, with no quotes or trailing spaces. |
+| `PDF not found at: ...` | Only `ingest.py` needs the PDF. The report is not bundled; save your copy in this folder as `Umicore Annual Report 2025.pdf`. |
+| `Vector store './chroma_db' not found.` | The store is committed, so this means it was deleted — restore it with `git checkout chroma_db`, or rebuild via `ingest.py`. |
 | `Collection ... is empty.` | Re-run `ingest.py`. |
 | Answers are "I don't know" too often | Raise `TOP_K` / `MAX_CONTEXT_CHUNKS` in `ask.py`. |
 | `chroma_db/` grows by ~9 MB per ingest | Expected. Chroma drops the old collection but leaves its UUID-named folder on disk. To reclaim: delete the whole `chroma_db/` folder and re-run `ingest.py`. |
