@@ -7,9 +7,10 @@ come only from the report; if it does not contain the answer, the bot replies
 **"I don't know about this."** rather than guessing, and every answer cites the
 pages it was written from.
 
-> The hosted app is password-protected. Every answer spends the owner's OpenAI
-> credits, so the link is not open to whoever finds it — ask the owner for the
-> phrase, or run your own copy (below).
+> **The app is public but password-protected.** No Streamlit account is needed
+> — anyone can open the link, and a password field is the first thing they
+> meet. Ask the owner for the phrase, or run your own copy (below). The gate
+> exists because every answer spends the owner's OpenAI credits.
 
 Nothing to install to use it. Open the link, ask a question, and expand
 **Sources** under the answer to read the exact chunks of the report it was
@@ -553,7 +554,16 @@ This repo is already deployed on Streamlit Community Cloud:
 | URL | <https://umicore-rag.streamlit.app/> |
 | Tracks | branch `main`, entry point `app.py` |
 | Python | 3.11 |
+| Visibility | **Settings → Sharing**: *public and searchable* — no Streamlit account needed to open it |
 | Secrets | `OPENAI_API_KEY`, `APP_PASSWORD` — set in the app's **Settings → Secrets**, never in the repo |
+
+Those last two work together, and it is worth being clear which does what.
+Streamlit's sharing setting decides who may **load** the app; `APP_PASSWORD`
+decides who may **use** it. Public sharing plus a password means anyone can
+reach the URL and nobody gets an answer without the phrase — which is the
+intended arrangement here. Set sharing to private instead and viewers would
+need a Streamlit account *as well as* the password, which locks out anyone you
+just want to hand a link to.
 
 **It redeploys itself on every push to `main`.** There is no deploy step to
 run: commit, push, and the app rebuilds. Use **Reboot** (app menu → Reboot) to
