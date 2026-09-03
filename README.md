@@ -590,10 +590,26 @@ Every answer spends **your** OpenAI credits, and the app has no rate limiting.
 
 - **Set a hard monthly spend cap** in the OpenAI billing dashboard. It is the
   only limit that cannot be bypassed, and the only one worth relying on.
-- **Set `APP_PASSWORD`** in the secrets to put a password in front of the app.
+- **Set `APP_PASSWORD`** to put a password in front of the app. **You invent
+  this value** — it is not issued by OpenAI, GitHub or Streamlit, and there is
+  nowhere to go and fetch it. Pick a long phrase and give it to whoever should
+  have access.
+
+  Where it goes depends on where the app runs:
+
+  | Running | Put it in | Looks like |
+  | --- | --- | --- |
+  | Streamlit Community Cloud | app → **Settings → Secrets** | `APP_PASSWORD = "your long phrase"` |
+  | Locally | `.env`, uncommented | `APP_PASSWORD=your long phrase` |
+
+  Both files ship with the line present but commented out, so the app is open
+  until you deliberately switch the gate on. Unset means no gate — that is the
+  sensible default locally and the wrong one on a public URL.
+
   The gate runs before the vector store is opened, so an unauthenticated
-  visitor cannot trigger any API call. Leave it unset and the app is open to
-  anyone with the link.
+  visitor cannot trigger any API call. Changing it later means editing the
+  secret and letting the app reboot; there is no password reset flow, because
+  there are no accounts — just the one shared phrase.
 
 ### If chromadb fails to import on first deploy
 
