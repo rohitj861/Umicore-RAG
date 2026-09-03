@@ -1,35 +1,48 @@
 # Umicore Annual Report 2025 — Q&A (RAG)
 
-Ask questions in plain English about `Umicore Annual Report 2025.pdf`.
-Answers come only from the PDF. If the report doesn't contain the answer, the
-bot replies **"I don't know about this."** rather than guessing.
+**Live app → <https://umicore-rag.streamlit.app/>**
 
-```
-| HUMAN | -> What was Umicore's adjusted EBITDA in 2025?
+Ask questions in plain English about the Umicore Annual Report 2025. Answers
+come only from the report; if it does not contain the answer, the bot replies
+**"I don't know about this."** rather than guessing, and every answer cites the
+pages it was written from.
 
-| ASSISTANT | -> Umicore's adjusted EBITDA in 2025 was € 847 million (page 18).
+> The hosted app is password-protected. Every answer spends the owner's OpenAI
+> credits, so the link is not open to whoever finds it — ask the owner for the
+> phrase, or run your own copy (below).
 
-SOURCES:
-  - Umicore Annual Report 2025.pdf (page 18)
-```
+Nothing to install to use it. Open the link, ask a question, and expand
+**Sources** under the answer to read the exact chunks of the report it was
+written from — the quickest way to check that a figure really is in the PDF.
 
-## Setup (once)
+Two searches run behind every question — embeddings for meaning, BM25 for exact
+wording — and the sidebar lets you switch to vector-only search to compare.
+*How it works* explains why.
+
+Everything below this line is for running or changing the project yourself.
+
+## Running your own copy
+
+Needed only to change the code, point it at a different PDF, or use it without
+the hosted app. The vector store is committed, so there is nothing to ingest
+and no PDF to download — a virtual environment and an OpenAI key is the whole
+setup.
 
 ```powershell
-cd "C:\Umicore RAG\rag-umicore"
+cd "C:\RAG-Umicore\Umicore-RAG"
 
 # 1. Virtual environment + dependencies
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 2. API key: create a file named .env containing one line
-#    OPENAI_API_KEY=sk-...
+# 2. API key: copy the template, then put your real key in the copy
 Copy-Item .env.example .env
 notepad .env
-
-# That is all. The vector store under chroma_db/ is committed, so there is
-# nothing to ingest and no PDF to download - go straight to asking questions.
 ```
+
+`.env` is gitignored. `.env.example` also carries a commented-out
+`APP_PASSWORD` line — leave it commented for a local run and the app is open;
+uncomment it to put the same password gate in front of your local copy.
 
 ### Rebuilding the store
 
@@ -52,15 +65,17 @@ Committing the result replaces roughly 28 MB.
 
 ## Asking questions
 
-### Browser UI (easiest)
+The chat UI is the same whether you open the hosted app or run it locally —
+`app.py` is the one entry point, and the deployment runs exactly this file.
 
-```powershell
-.\.venv\Scripts\python.exe -m streamlit run app.py
-```
+| Where | How |
+| --- | --- |
+| **Hosted** | <https://umicore-rag.streamlit.app/> — nothing to install |
+| **Local** | `.\.venv\Scripts\python.exe -m streamlit run app.py` → <http://localhost:8501> |
 
-Opens a chat window at <http://localhost:8501>. Each answer carries a
-**Sources** panel you can expand to read the exact chunks of the report it was
-written from — the quickest way to check an answer is really in the PDF.
+Each answer carries a **Sources** panel you can expand to read the exact chunks
+of the report it was written from — the quickest way to check an answer is
+really in the PDF.
 
 The sidebar has a **Search** switch with two modes:
 
@@ -84,10 +99,15 @@ Note that a bare figure typed on its own (`19,374,073`) is refused in *both*
 modes — the prompt answers questions, and a number alone is not one.
 
 Type **exit** (or `quit`, `bye`, `q`) to end the conversation; a *Start a new
-chat* button appears. Closing the browser tab leaves the server running — stop
-it with `Ctrl+C` in the terminal.
+chat* button appears. On a local run, closing the browser tab leaves the server
+running — stop it with `Ctrl+C` in the terminal.
 
-### Terminal
+Follow-up questions work in either place — the bot remembers the last 6
+exchanges, so "and what about the year before that?" resolves correctly. Memory
+is per browser session, so two people using the hosted app at once do not
+resolve follow-ups against each other's history.
+
+### Terminal (local only)
 
 ```powershell
 # Interactive chat (type 'exit' to quit)
@@ -97,8 +117,8 @@ it with `Ctrl+C` in the terminal.
 .\.venv\Scripts\python.exe ask.py "Who is the CEO?"
 ```
 
-Follow-up questions work — the bot remembers the last 6 exchanges, so
-"and what about the year before that?" resolves correctly.
+Same retrieval and the same prompt as the browser UI — `app.py` is a wrapper
+around this. The hosted app has no terminal, so this is for local use.
 
 ## How it works
 
@@ -524,7 +544,27 @@ percentage series, and a question the report cannot answer. That is not
 coverage of a 220-page report, and the model is not deterministic — treat the
 `SOURCES` panel as the check on any figure that matters.
 
-## Deploying it publicly
+## The deployment
+
+This repo is already deployed on Streamlit Community Cloud:
+
+| | |
+| --- | --- |
+| URL | <https://umicore-rag.streamlit.app/> |
+| Tracks | branch `main`, entry point `app.py` |
+| Python | 3.11 |
+| Secrets | `OPENAI_API_KEY`, `APP_PASSWORD` — set in the app's **Settings → Secrets**, never in the repo |
+
+**It redeploys itself on every push to `main`.** There is no deploy step to
+run: commit, push, and the app rebuilds. Use **Reboot** (app menu → Reboot) to
+force it, which is also what picks up a changed `requirements.txt`.
+
+Python 3.11 is older than the 3.14 this was developed on, and deliberately left
+alone — every pin resolves on it (all require ≥3.9 or ≥3.10, `pysqlite3-binary`
+ships a cp311 wheel, `chromadb` an abi3 wheel from cp39), and changing it costs
+a full rebuild for no gain.
+
+### Why it needs so little to run
 
 The vector store under `chroma_db/` is committed, so a hosted deployment has
 everything it needs: it never runs `ingest.py`, never needs the PDF, and spends
@@ -553,17 +593,20 @@ git push
   `git add *.py` does not. A store missing its segment folder opens without
   error and then answers nothing.
 
-On Streamlit Community Cloud:
+### Deploying a fresh copy
 
-1. **New app** → point it at this repo, branch `main`, file `app.py`.
-2. **Advanced settings → Python version.** Developed on 3.14; 3.13 also works.
-   Community Cloud offers only released, security-supported versions, and the
-   version is chosen here — there is no `runtime.txt`. Every pin resolves on
-   both: `pysqlite3-binary` ships cp38–cp314 wheels, `chromadb` an abi3 wheel
-   from cp39, and `streamlit` is a pure-Python wheel.
-3. **Secrets.** Paste the contents of `.streamlit/secrets.toml.example`, with
+To stand up your own instead of using the one above:
+
+1. **New app** → point it at your fork, branch `main`, file `app.py`.
+2. **Advanced settings → Python version.** Community Cloud offers only
+   released, security-supported versions, and the version is chosen here —
+   there is no `runtime.txt`. Anything from 3.10 up works: `pysqlite3-binary`
+   ships cp38–cp314 wheels, `chromadb` an abi3 wheel from cp39, and the rest
+   are pure-Python wheels.
+3. **Secrets.** Paste the contents of `.streamlit/secrets.toml.example` with
    your real key. `app.py` copies these into the environment at startup, which
-   is where `ask.py` looks for them — there is no `.env` in a deployment.
+   is where `ask.py` looks for them — there is no `.env` in a deployment, and
+   secrets never belong in the repo.
 4. Deploy. First boot takes a few minutes.
 
 Only `requirements.txt` is present, which is what Community Cloud wants — it
@@ -584,13 +627,16 @@ After that, a cold start opens the 27 MB store and builds the BM25 index over
 session. No embeddings are computed at boot and no API call is made until
 someone asks a question.
 
-### Before you make the URL public
+### Guarding the URL
 
-Every answer spends **your** OpenAI credits, and the app has no rate limiting.
+A public Streamlit URL is reachable by anyone who has it, every answer spends
+the owner's OpenAI credits, and the app has no rate limiting. Two defences,
+both already in place on the deployment above:
 
-- **Set a hard monthly spend cap** in the OpenAI billing dashboard. It is the
-  only limit that cannot be bypassed, and the only one worth relying on.
-- **Set `APP_PASSWORD`** to put a password in front of the app. **You invent
+- **A hard monthly spend cap** in the OpenAI billing dashboard. It is the only
+  limit that cannot be bypassed, and the only one worth relying on — a password
+  protects against strangers, not against a shared password.
+- **`APP_PASSWORD`**, which puts a password in front of the app. **You invent
   this value** — it is not issued by OpenAI, GitHub or Streamlit, and there is
   nowhere to go and fetch it. Pick a long phrase and give it to whoever should
   have access.
@@ -611,9 +657,10 @@ Every answer spends **your** OpenAI credits, and the app has no rate limiting.
   secret and letting the app reboot; there is no password reset flow, because
   there are no accounts — just the one shared phrase.
 
-### If chromadb fails to import on first deploy
+### If chromadb fails to import on a deploy
 
-Some hosting images ship an sqlite older than the 3.35 chromadb requires.
+Community Cloud runs Debian 11, which ships sqlite 3.34 - below the 3.35
+chromadb requires.
 `requirements.txt` already installs `pysqlite3-binary` on Linux and `app.py`
 swaps it in for the stdlib module before chromadb loads, so this should be
 handled — but that swap is what the traceback will be about if it isn't.
@@ -660,18 +707,26 @@ with that same model too, so the setting governs both.
 
 | Message | Fix |
 | --- | --- |
-| `OPENAI_API_KEY not found.` | Create `.env` with your key. Watch for Notepad saving it as `.env.txt`. |
+| `OPENAI_API_KEY not found.` | Locally: create `.env` with your key - watch for Notepad saving it as `.env.txt`. On the hosted app: the secret is missing or misspelt in **Settings > Secrets**, and note it is TOML there (`OPENAI_API_KEY = "sk-..."`, quoted) rather than `.env` syntax. |
 | `OPENAI_API_KEY is still the placeholder` | `.env` still holds the example value. Put your real key in it. |
 | `OpenAI rejected the API key in .env.` | The key reached OpenAI and was refused — check it is complete and current, with no quotes or trailing spaces. |
 | `PDF not found at: ...` | Only `ingest.py` needs the PDF. The report is not bundled; save your copy in this folder as `Umicore Annual Report 2025.pdf`. |
-| `Vector store './chroma_db' not found.` | The store is committed, so this means it was deleted — restore it with `git checkout chroma_db`, or rebuild via `ingest.py`. |
+| `Vector store './chroma_db' not found.` | The store is committed, so locally this means it was deleted - restore it with `git checkout chroma_db`, or rebuild via `ingest.py`. On the hosted app it means the store was never pushed: check `git ls-files chroma_db` lists the segment folder as well as `chroma.sqlite3`. |
 | `Collection ... is empty.` | Re-run `ingest.py`. |
 | `git status` shows `chroma_db/chroma.sqlite3` modified, and you changed nothing | Opening the store writes to internal sqlite pages, so simply running the app dirties the tracked file. The data is unchanged (same size, same contents). Discard it with `git checkout chroma_db`. |
 | Answers are "I don't know" too often | Raise `TOP_K` in `retrieval.py` / `MAX_CONTEXT_CHUNKS` in `ask.py` — but re-measure afterwards. Depth is only safe because table headers travel with their rows; on a store built without that, raising it produced confidently wrong figures. See *Table headers are carried onto their rows*. |
 | `chroma_db/` seems to be growing | It no longer should. `delete_collection()` used to leave each run's UUID-named segment folder on disk and its sqlite pages unreclaimed, which grew a 28 MB store to 51 MB over three ingests. `ingest.py` now deletes the store directory before rebuilding, so a rebuild starts from nothing. It refuses to delete a directory without a `chroma.sqlite3` in it, in case `persist_dir` is mistyped. |
 
-Note: `.env` holds a real API key. It's already in `.gitignore` — keep it that
-way, and don't commit `chroma_db/` either (it's ignored too).
+Two notes on what is and isn't tracked, because they point opposite ways:
+
+- **`.env` holds a real API key and must never be committed.** It is in
+  `.gitignore`, along with `.streamlit/secrets.toml`. Keep both there. On the
+  hosted app the key lives in **Settings → Secrets** instead, and the two are
+  separate keys unless you deliberately use the same one.
+- **`chroma_db/` *is* committed, on purpose.** The line for it in `.gitignore`
+  is commented out. The deployment never runs `ingest.py`, so the store has to
+  ship with the repo — ignoring it would leave the hosted app with nothing to
+  search.
 
 ## License
 
