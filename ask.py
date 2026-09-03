@@ -1,9 +1,11 @@
 # ask.py
 """Ask any question about the ingested PDF (Umicore Annual Report 2025).
 
-Answers are grounded strictly in the chunks stored in the Chroma vector store
-built by ingest.py. If the PDF does not contain the answer, the bot replies
-with "I don't know about this." instead of guessing.
+Answers are grounded strictly in the chunks stored by ingest.py. Those chunks
+are found by two searches at once - dense vector similarity over Chroma and
+BM25 keyword matching - whose rankings are combined by reciprocal rank fusion;
+retrieval.py holds that machinery. If the PDF does not contain the answer, the
+bot replies with "I don't know about this." instead of guessing.
 
 Usage:
     python ask.py                  # interactive chat
@@ -14,7 +16,6 @@ Usage:
 import os
 import re
 import sys
-from itertools import zip_longest
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,6 +26,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
+from retrieval import HybridRetriever
+
 PERSIST_DIR = "chroma_db"
 COLLECTION = "umicore-annual-report"
 EMBED_MODEL = "text-embedding-3-small"  # must match ingest.py
@@ -34,8 +37,12 @@ CHAT_MODEL = "gpt-4o-mini"
 # measurably produced wrong figures - more context meant more lookalike tables
 # to misread - and k=6 was the safest setting available. With headers attached,
 # k=10 answered every graded case correctly and k=6 missed facts that sit just
-# outside it. Re-measure before changing either number.
-TOP_K = 10  # chunks fetched per search query
+# outside it.
+#
+# Both numbers were measured against fixed-size chunks and a vector-only
+# search. Semantic chunks are larger and vary in size, and fusion changes which
+# chunks arrive rather than how many, so the pair is worth re-measuring - see
+# README. TOP_K now lives in retrieval.py, where it applies to each retriever.
 MAX_SUBQUERIES = 4  # search queries per question: two forms x up to two topics
 MAX_CONTEXT_CHUNKS = 16  # total chunks handed to the LLM
 MAX_HISTORY_TURNS = 6  # remember the last N question/answer pairs
@@ -56,6 +63,19 @@ PLACEHOLDER_HINTS = ("your-openai-api-key", "your_key_here", "api-key-here", "xx
 # cost a correct answer.
 MULTIPART_HINT = re.compile(r"\b(and|also|as well as|plus|besides|versus|vs)\b", re.I)
 
+# Words this report uses in its own way, where a question phrased in ordinary
+# business English searches for the wrong thing. "Revenue" is the one measured
+# so far: the report's revenue row is labelled "Revenues (excluding metal)" and
+# is about a fifth of turnover, and a search for "total revenue in 2025" ranks
+# that row 40th - it never reaches the context, so the model answered with
+# turnover instead. Rewritten into the report's own words the same row ranks
+# 10th-12th in both retrievers.
+#
+# Matching one of these is enough on its own to pay for the rewrite call, which
+# is otherwise skipped for a simple first question. Add a term here only with a
+# measurement behind it; the rewriter is told what each one means.
+HOUSE_TERMS = re.compile(r"\brevenues?\b", re.I)
+
 # Removes list markers the rewriter may prefix to each query ("1. ", "- ").
 # Matching the marker shape matters: lstrip() over a digit set also eats a
 # query that legitimately begins with a number, turning "2024 turnover" into
@@ -69,7 +89,24 @@ HISTORY_EXCERPT = 400
 
 SYSTEM_PROMPT = (
     "You answer questions about the Umicore Annual Report 2025 using ONLY the "
-    "context extracted from that PDF.\n"
+    "context extracted from that PDF.\n\n"
+    # Stated before the numbered rules, and repeated in rule 9, because as a
+    # sub-bullet of rule 9 alone it was not applied. The note that discusses a
+    # figure at length outranks the statement that reports it in every search,
+    # so the note tends to arrive first and more often, and answering from
+    # whatever came first is exactly the habit this has to override. Asked for
+    # 2024 profit before income tax, the model took note F13's 1,375,542 -
+    # consolidated companies only - over the income statement's 1,424,122,
+    # even with the income statement sitting in the context.
+    "READ THIS FIRST. Some lines appear twice in the context: once in a "
+    "PRIMARY STATEMENT - a chunk headed 'Consolidated income statement', "
+    "'Consolidated balance sheet' or 'Consolidated statement of cash flows' - "
+    "and again in a NOTE, headed by F and a number ('F13 Income taxes') or by "
+    "'RELATIONSHIP BETWEEN'. The note's version is a differently-scoped "
+    "subtotal, not the same number. Before answering with any figure, scan the "
+    "whole context for a primary statement carrying that line; if one is "
+    "there, use ITS figure and say which statement it came from. Never answer "
+    "from the note because it appeared first, or more often.\n\n"
     "Rules:\n"
     "1. If the context answers NONE of the question, reply with exactly: "
     f'"{UNKNOWN_ANSWER}" and nothing else.\n'
@@ -97,12 +134,32 @@ SYSTEM_PROMPT = (
     "it is genuinely under a million.\n"
     "   If a table figure has no units header in the context, say its unit "
     "is unclear rather than assuming.\n"
+    "   BRACKETS MEAN NEGATIVE, AND CONVERT EXACTLY AS A POSITIVE DOES. "
+    "'(1,424,122)' under 'Thousands of EUR' is a LOSS of € 1.42 billion, and "
+    "must be written 'a loss of € 1.42 billion (1,424,122 thousand EUR)' or "
+    "'€ -1.42 billion'. Writing '€ (1,424,122) million' is WRONG twice over: "
+    "it keeps the raw thousands and labels them millions. Carry the sign into "
+    "words - say 'loss' or use a minus sign - and never leave brackets round "
+    "an unconverted figure.\n"
     "7. TABLE HEADER LINES. A chunk may begin with '[page N table header: "
     "...]'. That is the units and column layout of the table the rows below it "
     "came from, restored because the extraction separated it from those rows. "
     "Treat it as the header for those rows and nothing else.\n"
     "8. COLUMNS AND YEARS. Map a figure to a year using the header before "
-    "reporting it. Where the header names years and then repeats sub-labels, "
+    "reporting it.\n"
+    "   THE KEY FIGURES TABLES ARE HALF-YEAR THEN FULL-YEAR. A header reading "
+    "'Key figures H2 H2' over '(in million €) 2024 2025 2024 2025' - used by "
+    "'Group key figures' and by every business group's table - has FOUR "
+    "columns in this order: H2 2024, H2 2025, FULL-YEAR 2024, FULL-YEAR 2025. "
+    "The last two are the full year. So the row 'EBITDA 244 781 (1,025) 1,212' "
+    "gives full-year 2024 = (1,025) and full-year 2025 = 1,212; 244 and 781 "
+    "are half-year figures. Unless the question says 'H2', 'second half' or "
+    "'half year', it is asking for the FULL YEAR - the third and fourth "
+    "figures, not the first and second.\n"
+    "   A full-year figure in brackets is a loss, and it is still the answer. "
+    "Never take an earlier, positive-looking column because the full-year "
+    "figure is negative.\n"
+    "   Where the header names years and then repeats sub-labels, "
     "the figures in a row are grouped in the same order: with header "
     "'2024 2025 | Total Adjusted Adjustments Total Adjusted Adjustments', the "
     "row 'Turnover 14,853,681 14,859,584 (5,903) 19,374,073 18,849,795 "
@@ -114,8 +171,60 @@ SYSTEM_PROMPT = (
     "figure is ambiguous and name the candidates. NEVER pick a column because "
     "it looks plausible - a figure reported against the wrong year is worse "
     "than no figure.\n"
-    "9. Cite the page number(s) you used, e.g. (page 12).\n"
-    "10. Be concise; use bullet points when listing several facts."
+    "9. SCOPE: WHOSE FIGURE IS IT? The report states the same line at "
+    "several scopes, with different figures. Group adjusted EBITDA for 2025 "
+    "is 847; the Catalysis figure on the same row label is 450, and "
+    "Recycling's is 371. Reporting one as the other is a large error.\n"
+    "   The scopes, and how to recognise each from the table header:\n"
+    "   - the GROUP total - 'Group key figures', and the consolidated "
+    "statements ('Consolidated income statement', 'Consolidated balance "
+    "sheet');\n"
+    "   - one business group - 'Battery Materials Solutions key figures', "
+    "'Catalysis key figures', 'Recycling key figures', 'Specialty Materials "
+    "key figures';\n"
+    "   - 'of consolidated companies', which EXCLUDES associates and joint "
+    "ventures and so differs from the Group figure;\n"
+    "   - the parent company Umicore SA's own statutory accounts.\n"
+    "   Rules:\n"
+    "   - If the question names a scope, answer at that scope.\n"
+    "   - If it does not name one, give the GROUP figure and say it is the "
+    "Group figure.\n"
+    "   - ALWAYS name the scope of any figure you report - 'Group adjusted "
+    "EBITDA', 'Catalysis turnover', 'profit before income tax of "
+    "consolidated companies'. A bare figure with no scope is not an "
+    "acceptable answer for any line that appears at more than one scope.\n"
+    "   - If the context holds only a narrower scope, give that figure, say "
+    "plainly which scope it is, and say the Group figure is not in the "
+    "context. NEVER pass a business group's or a consolidated-companies "
+    "figure off as the Group total.\n"
+    "   - THE PRIMARY STATEMENTS OUTRANK THE NOTES. When the same line "
+    "appears both in a primary statement ('Consolidated income statement', "
+    "'Consolidated balance sheet', 'Consolidated statement of cash flows') "
+    "and in a note - a header starting with F and a number, such as 'F13 "
+    "Income taxes' - or under a heading containing 'RELATIONSHIP BETWEEN' or "
+    "'reconciliation', report the PRIMARY STATEMENT's figure and name that "
+    "statement. The note's variant is usually a differently-scoped subtotal "
+    "on the way to it. For 2025, the consolidated income statement gives "
+    "profit before income tax of 771,739; note F13 gives 845,345 for "
+    "consolidated companies only. The first is the answer to an unscoped "
+    "question; mention the second only if you explain what it is.\n"
+    "10. REVENUE AND TURNOVER ARE DIFFERENT FIGURES. In this report:\n"
+    "   - 'Turnover' is the total of outgoing sales invoices and INCLUDES the "
+    "value of the purchased metals;\n"
+    "   - the revenue line is labelled 'Revenues (excluding metal)' - the "
+    "same sales minus the value of the purchased metals.\n"
+    "   They differ by roughly a factor of five, so giving one when asked for "
+    "the other is a large error, not a rounding difference.\n"
+    "   'Revenues (excluding metal)' IS this report's revenue figure. When "
+    "the question asks about revenue - including 'total revenue' or just "
+    "'revenue' - answer with that row, note that it excludes metal, and give "
+    "the group total rather than one business group's. Do NOT reply that the "
+    "report does not cover revenue when that row is in the context; it is "
+    "the answer. Equally, never offer turnover as a stand-in for revenue, or "
+    "revenue as a stand-in for turnover - if the one asked for is genuinely "
+    "absent, say so without substituting the other.\n"
+    "11. Cite the page number(s) you used, e.g. (page 12).\n"
+    "12. Be concise; use bullet points when listing several facts."
 )
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
@@ -157,7 +266,16 @@ QUERY_PROMPT = ChatPromptTemplate.from_messages(
             "only one form loses whichever the answer happens to live in.\n"
             f"- At most {MAX_SUBQUERIES} lines. If more than two distinct "
             "things are asked, give each one a terse phrase instead.\n"
-            "- Keep the user's wording.\n"
+            "- Keep the user's wording, but add the report's where they "
+            "differ. This report calls its revenue line 'Revenues (excluding "
+            "metal)', a different and much smaller figure than 'turnover'. So "
+            'for "total revenue in 2025" emit BOTH the user\'s phrasing and '
+            "the report's:\n"
+            "    revenues excluding metal 2025\n"
+            "    What were the revenues excluding metal in 2025?\n"
+            "  Never swap turnover in for revenue or the other way round - "
+            "they are different figures, and searching for the wrong one "
+            "returns the wrong answer.\n"
             "- Never state a fact, figure or page number, even if you believe "
             "you know it. A query containing an answer you invented sends the "
             "search to the wrong part of the document.\n"
@@ -318,19 +436,40 @@ def open_vectorstore() -> Chroma:
     return vectordb
 
 
+def open_retriever() -> HybridRetriever:
+    """Open the store and build the keyword index that searches beside it.
+
+    Both halves of the hybrid come from the one Chroma collection, so there is
+    nothing to keep in sync and no second artefact to ship: re-running
+    ingest.py changes what BM25 indexes as well, automatically. Building that
+    index reads every chunk's text out of the store, which takes a second or
+    two at start-up - hence one retriever per process, held by the caller.
+    """
+    return HybridRetriever(open_vectorstore())
+
+
 class PdfChatbot:
     """Retrieval-augmented chatbot over a single ingested PDF."""
 
-    def __init__(self, k: int = TOP_K, vectordb: Chroma | None = None):
-        """Pass an already-open `vectordb` to skip reconnecting to Chroma.
+    def __init__(
+        self, retriever: HybridRetriever | None = None, use_bm25: bool = True
+    ):
+        """Pass an already-open `retriever` to skip rebuilding the indexes.
 
-        app.py opens the store once per server and hands the same handle to
-        every browser session; the CLI leaves it None and opens its own.
+        app.py opens the store and builds the BM25 index once per server and
+        hands the same retriever to every browser session; the CLI leaves it
+        None and opens its own.
+
+        `use_bm25` lives on the bot, not on the retriever, because the bot is
+        already per-session while the retriever is shared - so one visitor
+        switching to vector-only search cannot change what another visitor
+        gets. Flip it between questions at any time; it affects the next
+        search only, and nothing about the conversation so far.
         """
         require_api_key()
 
-        self.k = k
-        self.vectordb = vectordb if vectordb is not None else open_vectorstore()
+        self.retriever = retriever if retriever is not None else open_retriever()
+        self.use_bm25 = use_bm25
         self.llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
         self.chat_history: list = []
 
@@ -343,11 +482,18 @@ class PdfChatbot:
 
         A first, single-topic question is already its own best search query,
         so we skip the call. We only pay for it when there is history to
-        resolve or the question plausibly asks for more than one thing.
+        resolve, the question plausibly asks for more than one thing, or it
+        uses a word this report defines its own way - where the question is
+        precisely NOT its own best search query, because the wording the user
+        reaches for is not the wording the report indexes under.
         """
         if self.chat_history:
             return True
-        return bool(MULTIPART_HINT.search(question)) or question.count("?") > 1
+        return (
+            bool(MULTIPART_HINT.search(question))
+            or bool(HOUSE_TERMS.search(question))
+            or question.count("?") > 1
+        )
 
     def _search_queries(self, question: str) -> list[str]:
         """One standalone search query per distinct thing the user asked."""
@@ -365,31 +511,21 @@ class PdfChatbot:
         return [q for q in queries if q][:MAX_SUBQUERIES] or [question]
 
     def _retrieve(self, queries: list[str]) -> list[Document]:
-        """Search each query, then interleave the hits.
+        """Search every query with both retrievers, and fuse the rankings.
 
-        Interleaving (rather than concatenating) matters: with a flat cap, the
-        first sub-question's hits would fill every slot and the second would
-        get nothing - which is how a covered fact gets reported as missing.
+        Each query is run twice - once as an embedding against Chroma, once as
+        keywords against BM25 - and every ranking that comes back is merged by
+        reciprocal rank fusion, which is where the order the model finally sees
+        is decided. retrieval.py explains why ranks rather than scores are what
+        get added up, and how the same arithmetic stops one sub-question of a
+        multi-part question filling every slot.
+
+        With `use_bm25` off the keyword half is skipped and this is a plain
+        vector search - the behaviour this project shipped before fusion.
         """
-        per_query = [self.vectordb.similarity_search(q, k=self.k) for q in queries]
-
-        seen, merged = set(), []
-        for rank in zip_longest(*per_query):
-            for doc in rank:
-                if doc is None:
-                    continue
-                key = (
-                    doc.metadata.get("source"),
-                    doc.metadata.get("page"),
-                    doc.metadata.get("start_index"),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(doc)
-                if len(merged) >= MAX_CONTEXT_CHUNKS:
-                    return merged
-        return merged
+        return self.retriever.search(
+            queries, limit=MAX_CONTEXT_CHUNKS, use_bm25=self.use_bm25
+        )
 
     def _remember(self, question: str, answer: str) -> None:
         self.chat_history.extend([HumanMessage(question), AIMessage(answer)])

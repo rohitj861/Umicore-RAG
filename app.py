@@ -31,16 +31,36 @@ from ask import (
     EMBED_MODEL,
     EXIT_MESSAGE,
     MAX_CONTEXT_CHUNKS,
-    TOP_K,
     PdfChatbot,
     SetupError,
     _page_label,
     explain_api_error,
     is_exit_command,
-    open_vectorstore,
+    open_retriever,
 )
+from retrieval import TOP_K
 
 PDF_NAME = "Umicore Annual Report 2025"
+
+# The two retrieval modes offered in the sidebar, as label -> (use_bm25, blurb).
+# Hybrid is first so it is the default: it is what the store and the prompt
+# were tuned against, and vector-only is here to compare against, not to run
+# day to day.
+SEARCH_MODES = {
+    "Hybrid — vector + BM25": (
+        True,
+        "Two searches per query — embeddings for meaning, BM25 for exact "
+        "wording — merged by reciprocal rank fusion. Chunks both agree on "
+        "rank highest. Best for figures and named terms.",
+    ),
+    "Vector only": (
+        False,
+        "Embedding similarity alone, the way this project worked before "
+        "fusion. Weakest where meaning is thinnest: a search for the bare "
+        "figure `19,374,073` leads with the employee-numbers table, because "
+        "six digits give an embedding little to match on.",
+    ),
+}
 
 EXAMPLE_QUESTIONS = [
     "What was Umicore's adjusted EBITDA in 2025?",
@@ -101,14 +121,16 @@ def check_password() -> bool:
     return False
 
 
-@st.cache_resource(show_spinner="Opening the vector store...")
-def get_vectorstore():
-    """One Chroma handle per server process, shared by all browser sessions.
+@st.cache_resource(show_spinner="Opening the store and indexing...")
+def get_retriever():
+    """One Chroma handle and one BM25 index per server process.
 
-    Reopening it per rerun would re-read the store on every keystroke-driven
-    script run, which is the single slowest thing this app does.
+    Shared by all browser sessions: rebuilding either per rerun would re-read
+    the whole store on every keystroke-driven script run, which is the single
+    slowest thing this app does. Sharing is safe because a retriever holds no
+    conversation state - only the two indexes, which are read-only here.
     """
-    return open_vectorstore()
+    return open_retriever()
 
 
 def get_bot() -> PdfChatbot:
@@ -118,12 +140,23 @@ def get_bot() -> PdfChatbot:
     two users sharing one would resolve each other's follow-up questions.
     """
     if "bot" not in st.session_state:
-        st.session_state.bot = PdfChatbot(vectordb=get_vectorstore())
-    return st.session_state.bot
+        st.session_state.bot = PdfChatbot(retriever=get_retriever())
+
+    # Applied per question rather than at construction, so the sidebar switch
+    # takes effect on the next question instead of only in a fresh session.
+    bot = st.session_state.bot
+    bot.use_bm25 = SEARCH_MODES[st.session_state.search_mode][0]
+    return bot
 
 
-def render_sources(sources: list) -> None:
-    """Page citations for one answer, with the retrieved text behind them."""
+def render_sources(sources: list, mode: str | None = None) -> None:
+    """Page citations for one answer, with the retrieved text behind them.
+
+    `mode` labels which search produced them. Worth carrying per answer rather
+    than reading the sidebar: switching modes mid-conversation would otherwise
+    relabel every earlier answer with the setting now selected, which is
+    exactly backwards when the point of the switch is to compare them.
+    """
     if not sources:
         return
 
@@ -134,7 +167,8 @@ def render_sources(sources: list) -> None:
             seen.add(page)
             pages.append(page)
 
-    with st.expander(f"Sources — pages {', '.join(pages)}"):
+    label = f" · {mode}" if mode else ""
+    with st.expander(f"Sources — {len(sources)} chunks, pages {', '.join(pages)}{label}"):
         st.caption(
             "The exact chunks the answer was written from. Page numbers in the "
             "answer text can drift between similar tables; these are reliable."
@@ -183,17 +217,18 @@ def answer(question: str) -> None:
     with st.chat_message("user"):
         st.markdown(question)
 
+    mode = st.session_state.search_mode
     with st.chat_message("assistant"):
-        with st.spinner("Searching the report..."):
+        with st.spinner(f"Searching the report ({mode})..."):
             try:
                 text, sources = get_bot().ask(question)
             except Exception as exc:  # API/network hiccup - keep the chat alive
                 text, sources = explain_api_error(exc), []
         st.markdown(text)
-        render_sources(sources)
+        render_sources(sources, mode)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": text, "sources": sources}
+        {"role": "assistant", "content": text, "sources": sources, "mode": mode}
     )
 
 
@@ -211,10 +246,23 @@ with st.sidebar:
         "rather than guessing."
     )
 
+    st.subheader("Search")
+    st.radio(
+        "How to find the chunks",
+        list(SEARCH_MODES),
+        key="search_mode",
+        help=(
+            "Switch freely between questions — it changes the next search "
+            "only, and nothing about the conversation so far."
+        ),
+    )
+    st.caption(SEARCH_MODES[st.session_state.search_mode][1])
+
     st.subheader("Settings")
     st.caption(
         f"Chat model `{CHAT_MODEL}` · embeddings `{EMBED_MODEL}` · "
-        f"{TOP_K} chunks per search, {MAX_CONTEXT_CHUNKS} max in context"
+        f"{TOP_K} chunks per retriever per query, "
+        f"{MAX_CONTEXT_CHUNKS} max in context"
     )
 
     if st.button("Clear conversation", use_container_width=True):
@@ -267,7 +315,7 @@ else:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        render_sources(message.get("sources", []))
+        render_sources(message.get("sources", []), message.get("mode"))
 
 # Starter questions, shown only while the chat is genuinely empty.
 if not st.session_state.messages and not pending:

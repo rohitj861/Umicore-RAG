@@ -4,10 +4,15 @@
 python-dotenv==1.2.2
 pypdf==6.14.2
 langchain-core==1.5.3
-langchain-text-splitters==1.1.2
 langchain-openai==1.4.1
 langchain-chroma==1.1.0
 chromadb==1.5.9
+
+# BM25, the keyword half of the hybrid search in retrieval.py. Pure Python on
+# top of numpy, which chromadb already pulls in, so this adds no wheel of its
+# own to a deployment.
+rank-bm25==0.2.2
+
 streamlit==1.61.1
 
 # Linux only, and only for deployment: chromadb needs sqlite >= 3.35 and some

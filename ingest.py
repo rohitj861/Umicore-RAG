@@ -11,16 +11,21 @@ from dotenv import load_dotenv
 
 from pypdf import PdfReader
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 
+from chunking import MAX_CHUNK_CHARS, MIN_CHUNK_CHARS, SemanticChunker
+
 
 # A statement page prints its units and year columns once, at the top of the
-# table, then many rows beneath. Splitting at 800 characters puts most of those
-# rows in chunks that no longer contain the header: on page 91 the header sits
-# at offset ~1100 and the Turnover row at ~1874, so the row-bearing chunk
-# arrives with six bare numbers and nothing to say which year each belongs to.
+# table, then many rows beneath. Any split puts most of those rows in chunks
+# that no longer contain the header: on page 91 the header sits at offset ~1100
+# and the Turnover row at ~1874, so the row-bearing chunk arrives with six bare
+# numbers and nothing to say which year each belongs to. Semantic chunking
+# narrows this - rows that belong together now tend to stay together - but does
+# not remove it, because a long table still exceeds the size cap and because
+# the header band and the first data row are exactly the pair of neighbours
+# whose embeddings differ most.
 UNITS_LINE = re.compile(
     r"(?:Thousands|Millions|Billions) of EUR"  # statement tables
     r"|\(in (?:million|thousand|billion)s? ?€\)"  # segment key figures
@@ -213,8 +218,8 @@ def ingest_pdf_to_chroma(
     pdf_path: str = "Umicore Annual Report 2025.pdf",
     persist_dir: str = "chroma_db",
     collection_name: str = "umicore-annual-report",
-    chunk_size: int = 800,
-    chunk_overlap: int = 150,
+    min_chunk_chars: int = MIN_CHUNK_CHARS,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
 ) -> None:
     # 1) Load environment variables (OPENAI_API_KEY)
     load_dotenv()
@@ -240,15 +245,29 @@ def ingest_pdf_to_chroma(
     docs = load_pdf_pages(pdf_file)
     print(f"   Loaded {len(docs)} pages with extractable text")
 
-    print("2) Splitting into chunks (for better retrieval)...")
+    print("2) Splitting into semantic chunks...")
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        add_start_index=True,  # keeps start position for traceability
+    # The same embedding model as the store below. It has to be: a boundary is
+    # decided by distances in this model's space, so measuring with one model
+    # and searching with another would place the cuts to suit a geometry
+    # nothing downstream uses. The units embedded here are cheap - a page of
+    # short lines costs a fraction of a cent - and are not stored; only the
+    # chunk embeddings Chroma makes in step 3 are.
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    chunker = SemanticChunker(
+        embeddings,
+        min_chunk_chars=min_chunk_chars,
+        max_chunk_chars=max_chunk_chars,
     )
-    chunks = splitter.split_documents(docs)
-    print(f"   Created {len(chunks)} chunks")
+    chunks = chunker.split_documents(docs)
+
+    sizes = sorted(len(chunk.page_content) for chunk in chunks)
+    median = sizes[len(sizes) // 2] if sizes else 0
+    print(
+        f"   Created {len(chunks)} chunks "
+        f"(median {median} chars, largest {sizes[-1] if sizes else 0})"
+    )
 
     headers = {doc.metadata["page"]: table_headers(doc.page_content) for doc in docs}
     tagged = add_table_headers(chunks, headers)
@@ -259,8 +278,6 @@ def ingest_pdf_to_chroma(
     )
 
     print("3) Creating embeddings and building vector store...")
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
     vectordb = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
