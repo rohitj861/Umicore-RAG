@@ -39,27 +39,41 @@ from ask import (
     is_exit_command,
     open_retriever,
 )
-from retrieval import TOP_K, MetadataFilter
+from retrieval import CHAPTER_SEPARATOR, TOP_K, MetadataFilter
 
 PDF_NAME = "Umicore Annual Report 2025"
 
-# The two retrieval modes offered in the sidebar, as label -> (use_bm25, blurb).
+# The retrieval modes offered in the sidebar, as
+# label -> (use_bm25, use_metadata_filter, blurb).
 # Hybrid is first so it is the default: it is what the store and the prompt
 # were tuned against, and vector-only is here to compare against, not to run
-# day to day.
+# day to day. Metadata filtering is the same hybrid search restricted to the
+# sections and pages picked beneath it; its controls only appear while it is
+# selected, so the other two modes always search the whole report.
+FILTER_MODE = "Metadata filtering — hybrid within chosen sections"
 SEARCH_MODES = {
     "Hybrid — vector + BM25": (
         True,
+        False,
         "Two searches per query — embeddings for meaning, BM25 for exact "
         "wording — merged by reciprocal rank fusion. Chunks both agree on "
         "rank highest. Best for figures and named terms.",
     ),
     "Vector only": (
         False,
+        False,
         "Embedding similarity alone, the way this project worked before "
         "fusion. Weakest where meaning is thinnest: a search for the bare "
         "figure `19,374,073` leads with the employee-numbers table, because "
         "six digits give an embedding little to match on.",
+    ),
+    FILTER_MODE: (
+        True,
+        True,
+        "Hybrid search, restricted by each chunk's metadata to the report "
+        "sections and pages picked below. Use it when a line appears in "
+        "several parts of the report — adjusted EBITDA restricted to "
+        "Performance keeps the segment tables and leaves out the notes.",
     ),
 }
 
@@ -151,14 +165,27 @@ def get_bot() -> PdfChatbot:
     return bot
 
 
+def filtering_selected() -> bool:
+    """Whether the sidebar's search mode is the metadata-filtering one."""
+    return SEARCH_MODES[st.session_state.search_mode][1]
+
+
 def current_filter() -> MetadataFilter | None:
     """The sidebar's metadata filter, or None when it restricts nothing.
+
+    Always None outside the metadata-filtering mode, whatever was picked while
+    it was selected: the other modes promise the whole report, and a filter
+    left over from earlier would break that promise invisibly, its controls
+    being hidden.
 
     The page range only becomes part of the filter once it is narrower than
     the whole report. Left at full width it would still exclude nothing, but it
     would also label every answer "filtered" and send Chroma a `where` clause
     for no reason.
     """
+    if not filtering_selected():
+        return None
+
     chapters = tuple(st.session_state.get("filter_chapters", ()))
     first, last = st.session_state.get("filter_pages", (None, None))
     page_count = get_retriever().bm25.page_count()
@@ -182,16 +209,38 @@ def reset_filters(page_count: int) -> None:
     st.session_state.filter_pages = (1, page_count)
 
 
+def chapter_labels(names: list[str]) -> dict[str, str]:
+    """Display name for each chapter: its own title, not the full path.
+
+    The sidebar is narrow, and the four main chapters all begin
+    "Consolidated management report › ", so the full path was cut off at the
+    same point for each of them and they read identically. The section is
+    dropped unless two chapters would then share a title, which is the case
+    the full path exists for.
+    """
+    short = {name: name.split(CHAPTER_SEPARATOR)[-1] for name in names}
+    taken = list(short.values())
+    return {
+        name: title if taken.count(title) == 1 else name
+        for name, title in short.items()
+    }
+
+
 def render_filters() -> None:
     """Sidebar controls for restricting the search by chunk metadata.
 
-    Drawn only after the password gate, because listing the chapters needs the
-    store open. The options are read from the store itself rather than from
-    the PDF, which a deployment does not have - so the list always matches what
-    can actually be searched.
+    Shown only while the metadata-filtering mode is selected, directly under
+    the mode switch. Drawn only after the password gate, because listing the
+    chapters needs the store open. The options are read from the store itself
+    rather than from the PDF, which a deployment does not have - so the list
+    always matches what can actually be searched.
     """
+    if not filtering_selected():
+        return
+
     bm25 = get_retriever().bm25
     chapters = {chapter.name: chapter for chapter in bm25.chapters()}
+    labels = chapter_labels(list(chapters))
     page_count = bm25.page_count()
 
     # Settle state before the widgets exist. A saved selection naming a chapter
@@ -203,15 +252,14 @@ def render_filters() -> None:
     first = min(max(first, 1), page_count)
     st.session_state.filter_pages = (first, min(max(last, first), page_count))
 
-    st.subheader("Filter")
-
     if chapters:
         st.multiselect(
             "Report sections",
             list(chapters),
             key="filter_chapters",
             format_func=lambda name: (
-                f"{name} (p. {chapters[name].first_page}–{chapters[name].last_page})"
+                f"{labels[name]} (p. {chapters[name].first_page}–"
+                f"{chapters[name].last_page})"
             ),
             placeholder="All sections",
             help=(
@@ -247,7 +295,10 @@ def render_filters() -> None:
             f"{metadata_filter.describe()}."
         )
     else:
-        st.caption(f"Searching the whole report ({len(bm25)} chunks).")
+        st.caption(
+            f"No restriction yet — searching the whole report ({len(bm25)} "
+            "chunks). Pick sections or narrow the pages."
+        )
 
     st.button(
         "Clear filters",
@@ -396,11 +447,11 @@ with st.sidebar:
             "only, and nothing about the conversation so far."
         ),
     )
-    st.caption(SEARCH_MODES[st.session_state.search_mode][1])
+    st.caption(SEARCH_MODES[st.session_state.search_mode][2])
 
     # Filled in by render_filters() once the visitor is past the password gate
     # - listing the report's sections needs the store open. Reserved here so
-    # the controls still sit beside the search mode rather than at the bottom.
+    # the filter controls appear right under the mode that uses them.
     filter_box = st.container()
 
     st.subheader("Settings")
