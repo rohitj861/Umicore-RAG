@@ -15,7 +15,6 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 
 from chunking import MAX_CHUNK_CHARS, MIN_CHUNK_CHARS, SemanticChunker
-from retrieval import CHAPTER_SEPARATOR
 
 
 # A statement page prints its units and year columns once, at the top of the
@@ -155,112 +154,15 @@ def add_table_headers(
     return tagged
 
 
-# Pages before the first bookmark - the cover, mostly - still need a section,
-# or a section filter could never select them.
-FRONT_MATTER = "Front matter"
-
-
-def _bookmark_page(reader: PdfReader, item) -> int | None:
-    """0-based page a bookmark points at, or None if it points nowhere usable."""
-    try:
-        page = reader.get_destination_page_number(item)
-    except Exception:  # external links, named destinations that don't resolve
-        return None
-    return page if isinstance(page, int) and page >= 0 else None
-
-
-def _title(item) -> str:
-    """A bookmark's title with its whitespace normalised.
-
-    Several of this report's titles carry trailing or doubled spaces, which
-    would otherwise show up in the UI and make two identical-looking chapters
-    distinct values.
-    """
-    return " ".join(str(item.title).split())
-
-
-def page_sections(reader: PdfReader) -> list[tuple[str, str]] | None:
-    """(section, chapter) for every page, read from the PDF's bookmarks.
-
-    The section is a top-level bookmark ("Consolidated management report") and
-    the chapter is the bookmark one level below it ("Financial statements"),
-    stored as the pair joined - "Consolidated management report › Financial
-    statements" - so a chapter name is unique even where two sections reuse a
-    title. Deeper bookmarks are ignored: this report nests down to single
-    accounting-policy paragraphs, far too fine to be worth a filter.
-
-    A page belongs to the last bookmark at or before it. Pages between a
-    section's own bookmark and its first chapter - a divider or an intro page -
-    are given to that first chapter, since that is what they introduce. The
-    granularity is the page: where a chapter starts part-way down a page, the
-    whole page goes to the new chapter.
-
-    Returns None when the PDF has no usable bookmarks, and callers then write no
-    section metadata at all. Guessing sections from the text would be a filter
-    that silently leaves chunks out.
-    """
-    try:
-        outline = reader.outline
-    except Exception:
-        return None
-
-    # pypdf's outline is a flat list where a nested list holds the children of
-    # the bookmark just before it.
-    sections: list[tuple[int, str, list[tuple[int, str]]]] = []
-    for item in outline:
-        if isinstance(item, list):
-            if sections:
-                for child in item:
-                    if isinstance(child, list):
-                        continue  # grandchildren
-                    page = _bookmark_page(reader, child)
-                    if page is not None:
-                        sections[-1][2].append((page, _title(child)))
-            continue
-        page = _bookmark_page(reader, item)
-        if page is not None:
-            sections.append((page, _title(item), []))
-
-    if not sections:
-        return None
-
-    sections.sort(key=lambda section: section[0])  # stable: outline order breaks ties
-    result = []
-    for number in range(len(reader.pages)):
-        current = [s for s in sections if s[0] <= number]
-        if not current:
-            result.append((FRONT_MATTER, FRONT_MATTER))
-            continue
-
-        _, section, children = current[-1]
-        children = sorted(children, key=lambda child: child[0])
-        started = [title for page, title in children if page <= number]
-        if started:
-            chapter = started[-1]
-        elif children:
-            chapter = children[0][1]
-        else:
-            chapter = section
-
-        name = section if chapter == section else f"{section}{CHAPTER_SEPARATOR}{chapter}"
-        result.append((section, name))
-    return result
-
-
 def load_pdf_pages(pdf_file: Path) -> list[Document]:
     """One Document per page, read straight from pypdf.
 
     Replaces langchain_community's PyPDFLoader (that package is being sunset)
     while keeping the same metadata keys that ask.py reads: source, page
     (0-based), page_label and total_pages.
-
-    Also writes `section` and `chapter` from the PDF's bookmarks, which is what
-    the UI's section filter matches against - see page_sections. The chunker
-    copies a page's metadata onto every chunk cut from it.
     """
     reader = PdfReader(str(pdf_file))
     total_pages = len(reader.pages)
-    sections = page_sections(reader)
 
     try:
         labels = reader.page_labels
@@ -273,75 +175,18 @@ def load_pdf_pages(pdf_file: Path) -> list[Document]:
         if not text:
             continue  # image-only / blank page: nothing to embed
 
-        metadata = {
-            "source": str(pdf_file),
-            "page": i,
-            "page_label": labels[i] if labels else str(i + 1),
-            "total_pages": total_pages,
-        }
-        if sections:
-            metadata["section"], metadata["chapter"] = sections[i]
-
-        pages.append(Document(page_content=text, metadata=metadata))
-    return pages
-
-
-def tag_sections(
-    pdf_path: str = "Umicore Annual Report 2025.pdf",
-    persist_dir: str = "chroma_db",
-    collection_name: str = "umicore-annual-report",
-    batch_size: int = 500,
-) -> None:
-    """Write `section` and `chapter` into an existing store, in place.
-
-    For a store built before ingest wrote them. Only metadata changes: no text
-    is re-split and nothing is re-embedded, so it costs nothing, needs no API
-    key, and every chunk - and therefore every search result - stays exactly as
-    it was measured. A full re-ingest would add the same fields but re-cut and
-    re-embed every chunk, which is a different store to evaluate.
-
-    Each record's existing metadata is passed back in full with the two fields
-    added, rather than relying on how a given Chroma version merges a partial
-    update.
-    """
-    import chromadb  # only this path talks to Chroma below the LangChain wrapper
-
-    pdf_file = Path(pdf_path)
-    if not pdf_file.exists():
-        raise FileNotFoundError(f"PDF not found at: {pdf_file.resolve()}")
-    if not (Path(persist_dir) / "chroma.sqlite3").exists():
-        raise FileNotFoundError(f"No Chroma store at ./{persist_dir} - run ingest.py first")
-
-    sections = page_sections(PdfReader(str(pdf_file)))
-    if not sections:
-        raise RuntimeError(f"'{pdf_file}' has no bookmarks to take sections from.")
-
-    collection = chromadb.PersistentClient(path=persist_dir).get_collection(
-        collection_name
-    )
-    record = collection.get(include=["metadatas"])
-
-    ids, metadatas, skipped = [], [], 0
-    for chunk_id, metadata in zip(record["ids"], record["metadatas"]):
-        metadata = dict(metadata or {})
-        page = metadata.get("page")
-        if not isinstance(page, int) or not 0 <= page < len(sections):
-            skipped += 1
-            continue
-        metadata["section"], metadata["chapter"] = sections[page]
-        ids.append(chunk_id)
-        metadatas.append(metadata)
-
-    for start in range(0, len(ids), batch_size):
-        collection.update(
-            ids=ids[start : start + batch_size],
-            metadatas=metadatas[start : start + batch_size],
+        pages.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "source": str(pdf_file),
+                    "page": i,
+                    "page_label": labels[i] if labels else str(i + 1),
+                    "total_pages": total_pages,
+                },
+            )
         )
-
-    chapters = len({metadata["chapter"] for metadata in metadatas})
-    print(f"Tagged {len(ids)} chunks across {chapters} chapters in ./{persist_dir}")
-    if skipped:
-        print(f"   Skipped {skipped} chunks with no usable page number")
+    return pages
 
 
 def reset_store(persist_path: Path) -> None:
@@ -463,12 +308,6 @@ def main() -> None:
     # may contain). Without this, 'python ingest.py > log.txt' dies on the
     # success message after the store has already been built.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-    # python ingest.py --tag-sections : add section metadata to the existing
-    # store without rebuilding it. See tag_sections.
-    if "--tag-sections" in sys.argv[1:]:
-        tag_sections()
-        return
 
     ingest_pdf_to_chroma(
         pdf_path="Umicore Annual Report 2025.pdf",

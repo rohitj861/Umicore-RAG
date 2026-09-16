@@ -64,15 +64,6 @@ own copy first:
 re-running never duplicates data and never accumulates dead segment folders.
 Committing the result replaces roughly 28 MB.
 
-Every chunk gets `section` and `chapter` metadata from the PDF's bookmarks,
-which the section filter matches against. For a store built before that, add
-them in place instead of rebuilding. Nothing is re-split or re-embedded, and it
-costs nothing:
-
-```powershell
-.\.venv\Scripts\python.exe ingest.py --tag-sections
-```
-
 ## Asking questions
 
 The chat UI is the same whether you open the hosted app or run it locally —
@@ -87,13 +78,12 @@ Each answer carries a **Sources** panel you can expand to read the exact chunks
 of the report it was written from — the quickest way to check an answer is
 really in the PDF.
 
-The sidebar has a **Search** switch with three modes:
+The sidebar has a **Search** switch with two modes:
 
 | Mode | What it does |
 | --- | --- |
 | **Hybrid — vector + BM25** (default) | Both searches per query, merged by reciprocal rank fusion |
 | **Vector only** | Embedding similarity alone — how this project worked before fusion |
-| **Metadata filtering — hybrid within chosen sections** | Hybrid search, restricted to the report sections and pages you pick — see below |
 
 Switch between questions to compare them; it affects the next search only and
 leaves the conversation intact. Each answer's Sources panel records the mode
@@ -108,36 +98,6 @@ in both modes; that is the honest result, not a broken switch.
 
 Note that a bare figure typed on its own (`19,374,073`) is refused in *both*
 modes — the prompt answers questions, and a number alone is not one.
-
-### Filtering by section or page
-
-Choosing **Metadata filtering** in the search switch opens two controls
-directly beneath it, which restrict which part of the report is searched:
-
-| Control | What it restricts to |
-| --- | --- |
-| **Report sections** | One or more chapters from the PDF's bookmarks — *Performance* (p. 13–27), *Corporate governance statement* (p. 28–60), *Financial statements* (p. 61–140), *Sustainability statements* (p. 141–204) and the smaller front and back sections. Empty means all. |
-| **Pages** | An inclusive page range, numbered as in the citations. |
-
-The two combine with AND, and the panel shows how many chunks are left to
-search — with a warning if a combination leaves none. The search itself is
-hybrid, with the same restriction applied to both the vector and the BM25
-half. The controls, and the filter, only apply while this mode is selected:
-switching back to Hybrid or Vector only searches the whole report again.
-
-Use it when a question's wording belongs to more than one part of the report:
-*"adjusted EBITDA"* restricted to *Performance* keeps the segment tables and
-leaves out the notes. Like the other modes, it applies to the next question
-only, and each answer's Sources panel records the mode and filter it ran
-under.
-
-A filtered **"I don't know about this."** only means the answer is not in the
-part searched, and the app says so under the reply. *Clear filters* widens the
-search back to the whole report.
-
-The sections are read from the store, not the PDF, so the hosted app offers
-them too. Sections are assigned per page: where a chapter starts part-way down
-a page, that whole page counts as the new chapter.
 
 Type **exit** (or `quit`, `bye`, `q`) to end the conversation; a *Start a new
 chat* button appears. On a local run, closing the browser tab leaves the server

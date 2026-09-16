@@ -26,7 +26,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-from retrieval import HybridRetriever, MetadataFilter
+from retrieval import HybridRetriever
 
 PERSIST_DIR = "chroma_db"
 COLLECTION = "umicore-annual-report"
@@ -452,10 +452,7 @@ class PdfChatbot:
     """Retrieval-augmented chatbot over a single ingested PDF."""
 
     def __init__(
-        self,
-        retriever: HybridRetriever | None = None,
-        use_bm25: bool = True,
-        metadata_filter: MetadataFilter | None = None,
+        self, retriever: HybridRetriever | None = None, use_bm25: bool = True
     ):
         """Pass an already-open `retriever` to skip rebuilding the indexes.
 
@@ -468,18 +465,11 @@ class PdfChatbot:
         switching to vector-only search cannot change what another visitor
         gets. Flip it between questions at any time; it affects the next
         search only, and nothing about the conversation so far.
-
-        `metadata_filter` restricts every search to part of the report - some
-        chapters, a page range - and sits on the bot for the same reason. None
-        searches the whole report. It narrows what is retrieved, not what is
-        remembered: a follow-up after the filter changes still resolves against
-        the earlier answers.
         """
         require_api_key()
 
         self.retriever = retriever if retriever is not None else open_retriever()
         self.use_bm25 = use_bm25
-        self.metadata_filter = metadata_filter
         self.llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
         self.chat_history: list = []
 
@@ -532,16 +522,9 @@ class PdfChatbot:
 
         With `use_bm25` off the keyword half is skipped and this is a plain
         vector search - the behaviour this project shipped before fusion.
-
-        With `metadata_filter` set, both searches only see chunks that pass it.
-        If nothing passes, nothing is retrieved and ask() answers with the
-        fallback without calling the model.
         """
         return self.retriever.search(
-            queries,
-            limit=MAX_CONTEXT_CHUNKS,
-            use_bm25=self.use_bm25,
-            metadata_filter=self.metadata_filter,
+            queries, limit=MAX_CONTEXT_CHUNKS, use_bm25=self.use_bm25
         )
 
     def _remember(self, question: str, answer: str) -> None:

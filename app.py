@@ -33,47 +33,32 @@ from ask import (
     MAX_CONTEXT_CHUNKS,
     PdfChatbot,
     SetupError,
-    _is_unknown,
     _page_label,
     explain_api_error,
     is_exit_command,
     open_retriever,
 )
-from retrieval import CHAPTER_SEPARATOR, TOP_K, MetadataFilter
+from retrieval import TOP_K
 
 PDF_NAME = "Umicore Annual Report 2025"
 
-# The retrieval modes offered in the sidebar, as
-# label -> (use_bm25, use_metadata_filter, blurb).
+# The two retrieval modes offered in the sidebar, as label -> (use_bm25, blurb).
 # Hybrid is first so it is the default: it is what the store and the prompt
 # were tuned against, and vector-only is here to compare against, not to run
-# day to day. Metadata filtering is the same hybrid search restricted to the
-# sections and pages picked beneath it; its controls only appear while it is
-# selected, so the other two modes always search the whole report.
-FILTER_MODE = "Metadata filtering — hybrid within chosen sections"
+# day to day.
 SEARCH_MODES = {
     "Hybrid — vector + BM25": (
         True,
-        False,
         "Two searches per query — embeddings for meaning, BM25 for exact "
         "wording — merged by reciprocal rank fusion. Chunks both agree on "
         "rank highest. Best for figures and named terms.",
     ),
     "Vector only": (
         False,
-        False,
         "Embedding similarity alone, the way this project worked before "
         "fusion. Weakest where meaning is thinnest: a search for the bare "
         "figure `19,374,073` leads with the employee-numbers table, because "
         "six digits give an embedding little to match on.",
-    ),
-    FILTER_MODE: (
-        True,
-        True,
-        "Hybrid search, restricted by each chunk's metadata to the report "
-        "sections and pages picked below. Use it when a line appears in "
-        "several parts of the report — adjusted EBITDA restricted to "
-        "Performance keeps the segment tables and leaves out the notes.",
     ),
 }
 
@@ -161,164 +146,16 @@ def get_bot() -> PdfChatbot:
     # takes effect on the next question instead of only in a fresh session.
     bot = st.session_state.bot
     bot.use_bm25 = SEARCH_MODES[st.session_state.search_mode][0]
-    bot.metadata_filter = current_filter()
     return bot
 
 
-def filtering_selected() -> bool:
-    """Whether the sidebar's search mode is the metadata-filtering one."""
-    return SEARCH_MODES[st.session_state.search_mode][1]
-
-
-def current_filter() -> MetadataFilter | None:
-    """The sidebar's metadata filter, or None when it restricts nothing.
-
-    Always None outside the metadata-filtering mode, whatever was picked while
-    it was selected: the other modes promise the whole report, and a filter
-    left over from earlier would break that promise invisibly, its controls
-    being hidden.
-
-    The page range only becomes part of the filter once it is narrower than
-    the whole report. Left at full width it would still exclude nothing, but it
-    would also label every answer "filtered" and send Chroma a `where` clause
-    for no reason.
-    """
-    if not filtering_selected():
-        return None
-
-    chapters = tuple(st.session_state.get("filter_chapters", ()))
-    first, last = st.session_state.get("filter_pages", (None, None))
-    page_count = get_retriever().bm25.page_count()
-
-    metadata_filter = MetadataFilter(
-        chapters=chapters,
-        first_page=first if first is not None and first > 1 else None,
-        last_page=last if last is not None and last < page_count else None,
-    )
-    return metadata_filter or None
-
-
-def reset_filters(page_count: int) -> None:
-    """Button callback: widen the filter back to the whole report.
-
-    A callback rather than code after the button, because Streamlit only lets
-    a widget's value be set before that widget is drawn in a run - and a
-    callback runs before the rerun draws anything.
-    """
-    st.session_state.filter_chapters = []
-    st.session_state.filter_pages = (1, page_count)
-
-
-def chapter_labels(names: list[str]) -> dict[str, str]:
-    """Display name for each chapter: its own title, not the full path.
-
-    The sidebar is narrow, and the four main chapters all begin
-    "Consolidated management report › ", so the full path was cut off at the
-    same point for each of them and they read identically. The section is
-    dropped unless two chapters would then share a title, which is the case
-    the full path exists for.
-    """
-    short = {name: name.split(CHAPTER_SEPARATOR)[-1] for name in names}
-    taken = list(short.values())
-    return {
-        name: title if taken.count(title) == 1 else name
-        for name, title in short.items()
-    }
-
-
-def render_filters() -> None:
-    """Sidebar controls for restricting the search by chunk metadata.
-
-    Shown only while the metadata-filtering mode is selected, directly under
-    the mode switch. Drawn only after the password gate, because listing the
-    chapters needs the store open. The options are read from the store itself
-    rather than from the PDF, which a deployment does not have - so the list
-    always matches what can actually be searched.
-    """
-    if not filtering_selected():
-        return
-
-    bm25 = get_retriever().bm25
-    chapters = {chapter.name: chapter for chapter in bm25.chapters()}
-    labels = chapter_labels(list(chapters))
-    page_count = bm25.page_count()
-
-    # Settle state before the widgets exist. A saved selection naming a chapter
-    # the store no longer has (after a re-ingest) would make the multiselect
-    # raise, and a page range from a longer PDF would fall outside the slider.
-    saved = st.session_state.get("filter_chapters", [])
-    st.session_state.filter_chapters = [name for name in saved if name in chapters]
-    first, last = st.session_state.get("filter_pages", (1, page_count))
-    first = min(max(first, 1), page_count)
-    st.session_state.filter_pages = (first, min(max(last, first), page_count))
-
-    if chapters:
-        st.multiselect(
-            "Report sections",
-            list(chapters),
-            key="filter_chapters",
-            format_func=lambda name: (
-                f"{labels[name]} (p. {chapters[name].first_page}–"
-                f"{chapters[name].last_page})"
-            ),
-            placeholder="All sections",
-            help=(
-                "Search only these parts of the report, taken from the PDF's "
-                "bookmarks. Leave empty to search everything."
-            ),
-        )
-    else:
-        st.caption(
-            "This store has no section metadata, so only the page range is "
-            "available. Run `python ingest.py --tag-sections` to add it."
-        )
-
-    if page_count > 1:
-        st.slider(
-            "Pages",
-            min_value=1,
-            max_value=page_count,
-            key="filter_pages",
-            help="Search only chunks from this page range (inclusive).",
-        )
-
-    metadata_filter = current_filter()
-    matching = bm25.count(metadata_filter)
-    if metadata_filter and matching == 0:
-        st.warning(
-            "No part of the report matches both restrictions, so every "
-            "question will be answered \"I don't know about this.\""
-        )
-    elif metadata_filter:
-        st.caption(
-            f"Searching {matching} of {len(bm25)} chunks — "
-            f"{metadata_filter.describe()}."
-        )
-    else:
-        st.caption(
-            f"No restriction yet — searching the whole report ({len(bm25)} "
-            "chunks). Pick sections or narrow the pages."
-        )
-
-    st.button(
-        "Clear filters",
-        on_click=reset_filters,
-        args=(page_count,),
-        disabled=not metadata_filter,
-        use_container_width=True,
-    )
-
-
-def render_sources(
-    sources: list, mode: str | None = None, scope: str | None = None
-) -> None:
+def render_sources(sources: list, mode: str | None = None) -> None:
     """Page citations for one answer, with the retrieved text behind them.
 
-    `mode` labels which search produced them and `scope` which filter it ran
-    under. Both are carried per answer rather than read from the sidebar:
-    changing either mid-conversation would otherwise relabel every earlier
-    answer with the setting now selected, which is exactly backwards when the
-    point of changing it is to compare.
+    `mode` labels which search produced them. Worth carrying per answer rather
+    than reading the sidebar: switching modes mid-conversation would otherwise
+    relabel every earlier answer with the setting now selected, which is
+    exactly backwards when the point of the switch is to compare them.
     """
     if not sources:
         return
@@ -331,8 +168,6 @@ def render_sources(
             pages.append(page)
 
     label = f" · {mode}" if mode else ""
-    if scope:
-        label += f" · filtered: {scope}"
     with st.expander(f"Sources — {len(sources)} chunks, pages {', '.join(pages)}{label}"):
         st.caption(
             "The exact chunks the answer was written from. Page numbers in the "
@@ -343,22 +178,6 @@ def render_sources(
             st.markdown(f"**{src} — page {_page_label(doc)}**")
             st.text(doc.page_content)
             st.divider()
-
-
-def render_filter_note(text: str, scope: str | None) -> None:
-    """Say so when a filtered search found nothing.
-
-    "I don't know about this." means the report does not contain the answer,
-    and under a filter that is no longer something the bot can know - the
-    answer may sit outside the part searched. The reply itself stays the exact
-    fallback sentence; this caption is what stops a reader taking it as a
-    verdict on the whole report.
-    """
-    if scope and _is_unknown(text):
-        st.caption(
-            f"The search was limited to {scope}. The answer may be elsewhere "
-            "in the report — clear the filters and ask again."
-        )
 
 
 def start_new_chat() -> None:
@@ -399,27 +218,17 @@ def answer(question: str) -> None:
         st.markdown(question)
 
     mode = st.session_state.search_mode
-    metadata_filter = current_filter()
-    scope = metadata_filter.describe() if metadata_filter else None
     with st.chat_message("assistant"):
-        where = f"; {scope}" if scope else ""
-        with st.spinner(f"Searching the report ({mode}{where})..."):
+        with st.spinner(f"Searching the report ({mode})..."):
             try:
                 text, sources = get_bot().ask(question)
             except Exception as exc:  # API/network hiccup - keep the chat alive
                 text, sources = explain_api_error(exc), []
         st.markdown(text)
-        render_filter_note(text, scope)
-        render_sources(sources, mode, scope)
+        render_sources(sources, mode)
 
     st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": text,
-            "sources": sources,
-            "mode": mode,
-            "scope": scope,
-        }
+        {"role": "assistant", "content": text, "sources": sources, "mode": mode}
     )
 
 
@@ -447,12 +256,7 @@ with st.sidebar:
             "only, and nothing about the conversation so far."
         ),
     )
-    st.caption(SEARCH_MODES[st.session_state.search_mode][2])
-
-    # Filled in by render_filters() once the visitor is past the password gate
-    # - listing the report's sections needs the store open. Reserved here so
-    # the filter controls appear right under the mode that uses them.
-    filter_box = st.container()
+    st.caption(SEARCH_MODES[st.session_state.search_mode][1])
 
     st.subheader("Settings")
     st.caption(
@@ -492,9 +296,6 @@ except SetupError as exc:
     st.info("Run the setup steps in README.md, then reload this page.")
     st.stop()
 
-with filter_box:
-    render_filters()
-
 if "messages" not in st.session_state:
     start_new_chat()
 
@@ -514,10 +315,7 @@ else:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        render_filter_note(message["content"], message.get("scope"))
-        render_sources(
-            message.get("sources", []), message.get("mode"), message.get("scope")
-        )
+        render_sources(message.get("sources", []), message.get("mode"))
 
 # Starter questions, shown only while the chat is genuinely empty.
 if not st.session_state.messages and not pending:
