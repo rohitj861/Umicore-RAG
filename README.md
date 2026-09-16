@@ -17,7 +17,7 @@ Nothing to install to use it. Open the link, ask a question, and expand
 written from — the quickest way to check that a figure really is in the PDF.
 
 Two searches run behind every question — embeddings for meaning, BM25 for exact
-wording — and the sidebar lets you switch to vector-only search to compare.
+wording — and the sidebar lets you switch to semantic-only search to compare.
 *How it works* explains why.
 
 Everything below this line is for running or changing the project yourself.
@@ -83,7 +83,7 @@ The sidebar has a **Search** switch with two modes:
 | Mode | What it does |
 | --- | --- |
 | **Hybrid — vector + BM25** (default) | Both searches per query, merged by reciprocal rank fusion |
-| **Vector only** | Embedding similarity alone — how this project worked before fusion |
+| **Semantic only** | Embedding similarity alone (vector search) — how this project worked before fusion |
 
 Switch between questions to compare them; it affects the next search only and
 leaves the conversation intact. Each answer's Sources panel records the mode
@@ -93,7 +93,7 @@ The difference shows up in **which pages reach the model**, so compare the
 Sources panels rather than only the answers. A question pinned to an exact
 figure is the clearest case — *"What does the turnover figure 19,374,073 refer
 to?"* cites page 90 (total segment turnover) in hybrid mode and the IFRS 15
-prose in vector-only. Expect many well-phrased questions to answer identically
+prose in semantic-only. Expect many well-phrased questions to answer identically
 in both modes; that is the honest result, not a broken switch.
 
 Note that a bare figure typed on its own (`19,374,073`) is refused in *both*

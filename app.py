@@ -44,8 +44,8 @@ PDF_NAME = "Umicore Annual Report 2025"
 
 # The two retrieval modes offered in the sidebar, as label -> (use_bm25, blurb).
 # Hybrid is first so it is the default: it is what the store and the prompt
-# were tuned against, and vector-only is here to compare against, not to run
-# day to day.
+# were tuned against, and semantic-only (vector search alone) is here to
+# compare against, not to run day to day.
 SEARCH_MODES = {
     "Hybrid — vector + BM25": (
         True,
@@ -53,7 +53,7 @@ SEARCH_MODES = {
         "wording — merged by reciprocal rank fusion. Chunks both agree on "
         "rank highest. Best for figures and named terms.",
     ),
-    "Vector only": (
+    "Semantic only": (
         False,
         "Embedding similarity alone, the way this project worked before "
         "fusion. Weakest where meaning is thinnest: a search for the bare "
