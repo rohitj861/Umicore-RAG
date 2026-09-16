@@ -7,6 +7,7 @@ announce themselves. A wrong figure looks exactly like a right one.
 
     python evaluate.py            # both retrieval modes
     python evaluate.py --hybrid   # hybrid only, roughly half the API calls
+    python evaluate.py --semantic # semantic only (Cohere-reranked if keyed)
     python evaluate.py --quick    # the group key figures only
 
 Each case names the figure the report gives and, where the report also prints a
@@ -31,6 +32,7 @@ it is not free.
 
 import re
 import sys
+from decimal import ROUND_HALF_UP, Decimal
 
 from ask import PdfChatbot, SetupError, explain_api_error, open_retriever
 
@@ -54,18 +56,22 @@ def spellings(value: float) -> set[str]:
     inside "4.48 billion" and reported a correct answer as the wrong figure.
     So a form is kept only if it is faithful to within 0.5%, which drops "4"
     (8% out) and "4.3" (1% out) while keeping "4.35".
+
+    Rounding is half-up, the way people and the model write figures. Python's
+    own formatting rounds the binary float, so 1,025 million came out as
+    "1.02" billion and a correct "€ 1.03 billion" was graded as missing.
     """
     out = set()
     for scale in (1, 1_000, 1_000_000):
-        scaled = value / scale
-        if scaled < 0.5:
+        scaled = Decimal(str(value)) / scale
+        if scaled < Decimal("0.5"):
             continue
         for places in (0, 1, 2):
-            rounded = round(scaled, places)
-            if abs(rounded - scaled) > 0.005 * scaled:
+            rounded = scaled.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+            if abs(rounded - scaled) > Decimal("0.005") * scaled:
                 continue
-            out.add(f"{scaled:,.{places}f}")
-            out.add(f"{scaled:.{places}f}")
+            out.add(f"{rounded:,.{places}f}")
+            out.add(f"{rounded:.{places}f}")
     return out
 
 
@@ -82,9 +88,15 @@ UNCONVERTED = re.compile(
 
 # A euro amount written as raw statement digits with no scale word at all -
 # "€ 19,374,073" - which rule 6 forbids for the same reason.
+#
+# Any thousands-separated figure counts, not only seven digits and up: "€
+# 771,739" is 771,739 thousand read as euros, and a run passed it while failing
+# the "€ (1,424,122)" beside it. The report's figures in euros under a million
+# are not what any case asks about. A decimal after the digits ("€ 1,357.3
+# million") is part of the figure, so the match may not stop short of it.
 EURO_RAW = re.compile(
     # Answers write the currency both ways, so both have to be caught.
-    r"(?:€|\bEUR)\s*\(?(\d{1,3}(?:,\d{3}){2,}|\d{7,})\)?"
+    r"(?:€|\bEUR)\s*\(?(\d{1,3}(?:,\d{3})+|\d{7,})(?![\d.,]\d)\)?"
     r"(?!\s*\)?\s*(?:thousand|million|billion))",
     re.I,
 )
@@ -134,7 +146,13 @@ def mentions(answer: str, wanted) -> bool:
 # two by looking at the pages the answer credits.
 
 NUMBER = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
-SCALES = {"thousand": 1e3, "million": 1e6, "billion": 1e9}
+SCALES = {"thousand": 1e3, "million": 1e6, "billion": 1e9, "mn": 1e6, "bn": 1e9}
+
+# An amount written with its scale word, in an answer or on a page: "€ 3.56
+# billion", "€ 3.6 bn", "847 million".
+STATED_AMOUNT = re.compile(
+    rf"(?<![\d.,])(?P<n>{NUMBER})\s*(?P<s>thousand|million|billion|mn|bn)\b", re.I
+)
 
 # A converted figure followed by the original in brackets, as rule 6 of the
 # prompt asks for: "€ 19.37 billion (19,374,073 thousand EUR)". Signs and
@@ -155,6 +173,27 @@ def _amount(number: str, scale: str) -> tuple[float, float]:
         float(number.replace(",", "")) * multiplier,
         0.5 * 10 ** -decimals * multiplier,
     )
+
+
+def stated_amounts(text: str) -> list[tuple[float, float]]:
+    """Every amount written with a scale word, as (EUR, rounding allowance)."""
+    return [_amount(match["n"], match["s"]) for match in STATED_AMOUNT.finditer(text)]
+
+
+def invented_originals(answer: str, page_text: dict[int, str]) -> list[str]:
+    """Bracketed originals that the report does not print anywhere.
+
+    A bracket presents its digits as the report's own, so they must be. The
+    model has written "€ 763 million (763,000 thousand EUR)" beside a key
+    figure printed in millions - the right amount, so pair_errors passes it,
+    but 763,000 is on no page of the report.
+    """
+    everything = "\n".join(page_text.values())
+    return [
+        match.group(0)
+        for match in FIGURE_PAIR.finditer(answer)
+        if not prints(everything, {match["b"]})
+    ]
 
 
 def pair_errors(answer: str) -> list[str]:
@@ -256,8 +295,12 @@ def citation_errors(answer: str, expected: list, page_text: dict[int, str]) -> l
     says - which is what "(page 6)" for adjusted EBITDA was. A range passes if
     any page in it prints one.
 
-    Converted figures ("1.42 billion") are never printed by the report; the
-    bracketed original beside them is what matches.
+    A converted figure ("€ 1.42 billion") is never printed as such in a table,
+    so the case's own figures are looked for too, as the report prints them.
+    And a page also passes if it states the answer's amount at its own
+    rounding: page 15 prints revenues as "€ 3.6 bn", which supports an answer
+    of "€ 3.56 billion (page 15)". Two amounts agree when they are within the
+    rounding each is written to, the allowance pair_errors uses.
     """
     cited = cited_pages(answer)
     if not cited:
@@ -269,10 +312,20 @@ def citation_errors(answer: str, expected: list, page_text: dict[int, str]) -> l
         for figure in ANSWER_FIGURE.findall(answer)
         if not YEAR.fullmatch(figure) and figure not in page_numbers
     }
+    answer_amounts = stated_amounts(answer)
+
+    def supports(text: str) -> bool:
+        if prints(text, forms):
+            return True
+        return any(
+            abs(page_value - value) <= (page_slack + slack) * (1 + 1e-9)
+            for page_value, page_slack in stated_amounts(text)
+            for value, slack in answer_amounts
+        )
 
     found = []
     for pages in cited:
-        if not any(prints(page_text.get(page, ""), forms) for page in pages):
+        if not any(supports(page_text.get(page, "")) for page in pages):
             label = f"{pages.start}-{pages.stop - 1}" if len(pages) > 1 else str(pages.start)
             found.append(f"page {label}")
     return found
@@ -331,6 +384,8 @@ def grade(answer: str, expected: list, wrong: list, page_text: dict[int, str]) -
         problems.append(f"unit: {error}")
     for pair in pair_errors(answer):
         problems.append(f"bracket: {pair!r} states two different amounts")
+    for pair in invented_originals(answer, page_text):
+        problems.append(f"bracket: {pair!r} gives an original the report does not print")
     for page in citation_errors(answer, expected, page_text):
         problems.append(f"citation: {page} prints none of the figures given")
     for statement in attribution_errors(answer, expected, page_text):
@@ -349,7 +404,10 @@ def grade(answer: str, expected: list, wrong: list, page_text: dict[int, str]) -
 GROUP_KEY_FIGURES = [
     ("What was the adjusted EBITDA in 2025?", [847], [450, 371, 108],
      "Group, page 18. Wrong: Catalysis 450, Recycling 371, Specialty 108"),
-    ("What was the adjusted EBIT in 2025?", [579], [383, 296],
+    # The thousands forms in this case and the two marked below are printed on
+    # pages 87, 91 and 86, which semantic-only search cites; without them a
+    # right citation there failed the citation check.
+    ("What was the adjusted EBIT in 2025?", [579, 579280], [383, 296],
      "Group 579. Wrong: Catalysis 383, Recycling 296"),
     ("What was the turnover in 2025?", [19374, 19374073], [4482, 13826],
      "Group 19,374. Wrong: Catalysis 4,482, Recycling 13,826"),
@@ -363,7 +421,7 @@ GROUP_KEY_FIGURES = [
      "Group 24.0%. Wrong: Catalysis 27.0%, Recycling 39.2%"),
     ("What was the net profit, Group share, in 2025?", [385, 384548], [288],
      "385. Wrong: 288 is ADJUSTED net profit"),
-    ("What was the adjusted net profit, Group share, in 2025?", [288], [384548],
+    ("What was the adjusted net profit, Group share, in 2025?", [288, 288000], [384548],  # thousands: p91
      "288. Wrong: 385 is unadjusted"),
     ("What was the R&D expenditure in 2025?", [206, 205702], [86, 74],
      "Group 206. Wrong: segment figures"),
@@ -382,7 +440,7 @@ GROUP_KEY_FIGURES = [
 # this: for 2025 the wanted column is last and hard to get wrong. Every wrong
 # figure here is that row's H2 2024 column.
 FULL_YEAR_VS_HALF_YEAR = [
-    ("What was the EBITDA in 2024?", [1025], [244],
+    ("What was the EBITDA in 2024?", [1025, 1025321], [244],  # thousands: p86
      "FY2024 (1,025), a loss. Wrong: 244 is H2 2024"),
     ("What was the adjusted EBITDA in 2024?", [763], [370],
      "FY2024 763. Wrong: 370 is H2"),
@@ -392,7 +450,9 @@ FULL_YEAR_VS_HALF_YEAR = [
      "FY2024 258. Wrong: 126 is H2"),
     ("What was the capital expenditure in 2024?", [555, 554665], [285],
      "FY2024 555. Wrong: 285 is H2"),
-    ("What were the revenues in 2024?", [3461], [1657],
+    # 3,461,000 too: the 2024 segment table (page 86) prints it in thousands,
+    # and citing that page is right.
+    ("What were the revenues in 2024?", [3461, 3461000], [1657],
      "FY2024 3,461. Wrong: 1,657 is H2"),
 ]
 
@@ -433,9 +493,20 @@ OTHER = [
 
 def run(cases: list, modes: list[tuple[str, bool]]) -> tuple[int, int, list]:
     retriever = open_retriever()
+    # Pace Cohere so a trial key's 10 calls a minute is never exceeded: an
+    # answer that falls back to embedding order is not a reranked answer, and
+    # grading it as one measures the wrong thing. COHERE_CALLS_PER_MINUTE
+    # raises the pace for a production key. Only semantic-only runs call Cohere.
+    reranker = retriever.reranker
+    if reranker is not None and reranker.calls_per_minute is None:
+        reranker.calls_per_minute = 10.0
     page_text = page_texts(retriever)
     passed = total = 0
     failures = []
+    # Semantic-only answers that were not reranked - no key, or Cohere failed
+    # and the search fell back to embedding order. Counted and shown, because
+    # a run full of them grades plain vector search, not the reranked mode.
+    not_reranked = 0
 
     for question, expected, wrong, note in cases:
         print(f"\n{question}")
@@ -466,6 +537,19 @@ def run(cases: list, modes: list[tuple[str, bool]]) -> tuple[int, int, list]:
                 print(f"         -> {problem}")
                 failures.append((question, label, problem))
 
+            status = bot.last_search.get("rerank")
+            if status and not status.startswith("reranked"):
+                not_reranked += 1
+                print(f"         (not reranked - {status})")
+
+    if any(not use_bm25 for _, use_bm25 in modes) and reranker is not None:
+        print(
+            f"\nCohere rerank ({reranker.model}): {reranker.calls} calls, "
+            f"{reranker.failures} failed; {not_reranked} semantic-only "
+            "answers were NOT reranked"
+            + ("" if reranker.enabled else " - COHERE_API_KEY is not set")
+        )
+
     return passed, total, failures
 
 
@@ -473,7 +557,12 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     args = set(sys.argv[1:])
-    modes = [("hybrid", True)] if "--hybrid" in args else [("hybrid", True), ("vector", False)]
+    if "--hybrid" in args:
+        modes = [("hybrid", True)]
+    elif "--semantic" in args:
+        modes = [("semantic", False)]
+    else:
+        modes = [("hybrid", True), ("semantic", False)]
     cases = (GROUP_KEY_FIGURES if "--quick" in args
              else GROUP_KEY_FIGURES + FULL_YEAR_VS_HALF_YEAR + SCOPE + OTHER)
 

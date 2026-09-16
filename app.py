@@ -55,10 +55,11 @@ SEARCH_MODES = {
     ),
     "Semantic only": (
         False,
-        "Embedding similarity alone, the way this project worked before "
-        "fusion. Weakest where meaning is thinnest: a search for the bare "
-        "figure `19,374,073` leads with the employee-numbers table, because "
-        "six digits give an embedding little to match on.",
+        "No keyword search. Embedding similarity finds 50 candidates per "
+        "query, and Cohere Rerank picks the most relevant — it reads the "
+        "question and each chunk together, which lifts table rows embeddings "
+        "rank too low. Without a Cohere key it is plain embedding order; each "
+        "answer's Sources say which ran.",
     ),
 }
 
@@ -86,7 +87,7 @@ def load_hosted_secrets() -> None:
     there; where both exist, st.secrets wins, because .env is only read later
     and load_dotenv() does not overwrite a variable that is already set.
     """
-    for name in ("OPENAI_API_KEY", "APP_PASSWORD"):
+    for name in ("OPENAI_API_KEY", "APP_PASSWORD", "COHERE_API_KEY", "COHERE_RERANK_MODEL"):
         if os.getenv(name):
             continue
         try:
@@ -147,6 +148,17 @@ def get_bot() -> PdfChatbot:
     bot = st.session_state.bot
     bot.use_bm25 = SEARCH_MODES[st.session_state.search_mode][0]
     return bot
+
+
+def rerank_label(status: str | None) -> str:
+    """A short note on reranking for the Sources label; empty for hybrid."""
+    if not status:
+        return ""
+    if status.startswith("reranked"):
+        return f" · {status}"
+    if status.startswith("off"):
+        return " · not reranked: no COHERE_API_KEY"
+    return " · not reranked: Cohere request failed"
 
 
 def render_sources(sources: list, mode: str | None = None) -> None:
@@ -224,6 +236,9 @@ def answer(question: str) -> None:
                 text, sources = get_bot().ask(question)
             except Exception as exc:  # API/network hiccup - keep the chat alive
                 text, sources = explain_api_error(exc), []
+        # Semantic-only search says whether Cohere reranked, so an answer from
+        # the embedding-order fallback cannot pass for a reranked one.
+        mode = mode + rerank_label(get_bot().last_search.get("rerank"))
         st.markdown(text)
         render_sources(sources, mode)
 

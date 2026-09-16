@@ -83,7 +83,11 @@ The sidebar has a **Search** switch with two modes:
 | Mode | What it does |
 | --- | --- |
 | **Hybrid — vector + BM25** (default) | Both searches per query, merged by reciprocal rank fusion |
-| **Semantic only** | Embedding similarity alone (vector search) — how this project worked before fusion |
+| **Semantic only** | No keyword search: embedding similarity finds 50 candidates per query, and **Cohere Rerank** orders them — see *Semantic only, reranked* |
+
+Semantic only needs a `COHERE_API_KEY` to rerank. Without one it runs as plain
+embedding search, the way this project worked before fusion. Each answer's
+Sources label says which ran: *reranked by rerank-v4.0-pro* or *not reranked*.
 
 Switch between questions to compare them; it affects the next search only and
 leaves the conversation intact. Each answer's Sources panel records the mode
@@ -383,24 +387,31 @@ nothing about brackets, so it now spells out that brackets mean negative, that
 the conversion applies unchanged, and that the sign must be carried into words.
 
 **What surrounds the figure is checked too.** A right figure can still come
-with details that are wrong, and three checks catch them. Each was written for
+with details that are wrong, and four checks catch them. Each was written for
 an answer that the checks above had passed:
 
 | Check | Fails an answer when | Measured example |
 | --- | --- | --- |
-| `pair_errors()` | the bracketed original is a different amount from the converted figure, beyond the rounding either side is written to | `€ 385 million (389,501 thousand EUR)`, where the bracket is total profit including minorities, not Group share; `€ -1.03 billion (1,025 thousand EUR)`, a thousandfold out |
-| `citation_errors()` | a cited page prints none of the figures the answer gives | adjusted EBITDA € 847 million "(page 6)"; the figure is on pages 8, 15, 16, 18, 26 and 50 |
+| `pair_errors()` | a bracketed original is a different amount from the converted figure, beyond the rounding either side is written to | `€ 385 million (389,501 thousand EUR)`, where the bracket is total profit including minorities, not Group share; `€ -1.03 billion (1,025 thousand EUR)`, a thousandfold out |
+| `invented_originals()` | a bracketed original is printed nowhere in the report | `€ 763 million (763,000 thousand EUR)` beside a key figure printed in millions |
+| `citation_errors()` | a cited page supports none of the figures the answer gives | adjusted EBITDA € 847 million "(page 6)"; the figure is on pages 8, 15, 16, 18, 26 and 50 |
 | `attribution_errors()` | a primary statement named as the source does not print the case's figure | gearing 37.4% "from the consolidated balance sheet"; it is a key figure (page 18) |
 
 Pages are read from the store, so the checks need no PDF. Statement pages are
 taken from the report's bookmarks (income statement 62 through cash flows 66),
 because pages 61–67 all print every statement's name in their navigation.
 
-A cited page is credited with any figure the answer states, so a second
-citation for a comparison year passes. A statement named only to set it
-aside ("not the Group total from the consolidated income statement") is not
-treated as a claim about the source. The summary counts problems by kind, so a
-run that only breaks citations reads that way at a glance.
+A cited page supports an answer if it prints any figure the answer states, or
+states the answer's amount at its own rounding: page 15's "€ 3.6 bn" supports
+"€ 3.56 billion (page 15)". So a second citation for a comparison year passes.
+A statement named only to set it aside ("not the Group total from the
+consolidated income statement") is not treated as a claim about the source.
+The summary counts problems by kind, so a run that only breaks citations reads
+that way at a glance.
+
+Figures are rounded half-up when matched, as they are written. Python's own
+float formatting turned 1,025 million into "1.02" billion, and a correct
+"€ 1.03 billion" was graded as missing.
 
 ### Half-year before full-year
 
@@ -432,18 +443,151 @@ Current state, 28 cases:
 
 | Mode | Score |
 | --- | --- |
-| **Hybrid — vector + BM25** | **10 / 28** — every figure right; 18 answers fail on how they describe it |
-| Vector only | not re-measured since the suite grew |
+| **Hybrid — vector + BM25** | **28 / 28**, the same in two runs |
+| **Semantic only, Cohere-reranked** | **28 / 28**, the same in two runs, every answer reranked — see *Semantic only, reranked* |
+| Semantic only, without reranking (no Cohere key) | **21 / 28**: every failure is a wrong or missing figure |
 
-Hybrid scored 28 / 28 before the checks on what surrounds the figure were
-added, and the answers have not got worse since. The grader now counts errors
-it used to pass. In the first run under it, no answer gave a wrong figure, a
-missing figure or an unconverted unit. The failures were 12 wrong statement
-attributions (most often a key figure credited to the consolidated income
-statement), 10 citations of pages that do not print the figure, and 2 bracket
-mismatches. Every one was checked against the store and is real. The model's
-page citations have always been the weak part; the app's Sources panel shows
-the pages that were actually retrieved.
+28 cases passing in two runs is not a guarantee. Answers vary somewhat from
+run to run, and the suite covers mostly key figures. See *Citations and
+sources* below for how the score went from 10 to 28.
+
+Without reranking, semantic only got the same 7 questions' figures wrong under
+the current prompt and the one before these citation changes, in two runs of
+each: adjusted
+EBITDA 2024 and 2025, adjusted EBIT 2024, the adjusted tax rate, revenues 2024,
+and profit before income tax in both of its cases. So the changes did not cause
+them. Its citations on the other 21 are all right. Separately, one
+interactive check gave 2024 turnover as € 19.37 billion (2025's figure) in
+semantic-only mode, though neither graded run did. That is the run-to-run
+variation the score above does not show.
+
+### Semantic only, reranked
+
+Semantic only missed those 7 not because it could not find the answer but
+because it ranked it too low. For each of them, the chunk printing the figure
+(the Group key figures on page 18, or the consolidated income statement on page
+62) was in its embedding ranking at **16th to 38th**, just outside the 16 it
+keeps. BM25 ranks the same chunks 2nd or 3rd. A table chunk is mostly numbers,
+and a question's embedding lands nearer to prose that discusses a figure than
+to the row that prints it.
+
+So semantic-only search now has two stages (`rerank.py`, wired in
+`retrieval.py`):
+
+1. **First stage, unchanged in kind:** embedding search, fetching
+   `RERANK_CANDIDATES` (50) per query instead of 16, so the chunk at 38th is in
+   the pool.
+2. **Second stage:** Cohere Rerank reads the query and each candidate together,
+   and the best 16 go on to fusion and the per-page cap exactly as before.
+
+It is still a semantic search: no keywords and no rewritten query are added.
+Hybrid search does not call the reranker at all, and its path is unchanged.
+
+Each query in a multi-part question is reranked separately, then fused, so each
+sub-question's best chunk still counts the same. A missing key, a refused
+request, or a timeout falls back to plain embedding order for that search.
+Rate limiting (HTTP 429) and server errors are retried up to three times first.
+The app never fails because of Cohere, and the Sources label, like
+`evaluate.py`, reports every answer that was not reranked.
+
+Cohere is called over HTTP with `httpx` rather than through its SDK, because
+the SDK would add packages that need building on a deploy. Each semantic-only
+question sends up to 4 rerank requests and the text of up to 200 candidate
+chunks to Cohere. The report is public, but that is one more provider seeing
+it, and one more bill: check Cohere's current pricing, and note that trial keys
+are rate limited.
+
+**Measured: 28 / 28 in two runs, up from 21 / 28.** Each run made 33 rerank
+calls, with none failing and every answer reranked. All 7 questions that plain
+semantic search got wrong are now right in both runs, most of them answered from
+page 18 (Group key figures) or page 62 (the income statement). Those are the
+pages it used to rank too low. On the first real call, the chunk printing 2024
+adjusted EBITDA moved from 29th in embedding order to 3rd.
+
+To measure it again:
+
+```powershell
+.\.venv\Scripts\python.exe evaluate.py --semantic
+```
+
+The run ends with a line counting Cohere calls, failures, and answers that were
+not reranked. A score from a run where that last number is not 0 is partly a
+plain embedding search score. The first attempt here was one: it scored 27 / 28
+with 5 answers not reranked, and its one failure was among them.
+
+**Trial keys allow 10 calls a minute**, and retrying a 429 for a few seconds
+does not get under a per-minute limit. That is what went wrong on the first
+attempt. `evaluate.py` therefore spaces calls to 10 a minute, which takes a
+semantic run to roughly five to eight minutes. Set `COHERE_CALLS_PER_MINUTE`
+higher for a production key.
+
+The app does not pace by default, because a visitor would wait instead. With a
+trial key, semantic-only questions beyond 10 calls a minute - one multi-part
+question can use 4 - fall back to embedding order, and their Sources label says
+so. Cohere's 429 response also describes trial keys as limited, so a
+production key is the one to put in the hosted app's secrets.
+
+### Citations and sources
+
+When the stricter checks were added, hybrid scored **10 / 28** on answers whose
+figures were all right. There were 12 wrong statement attributions, 10 citations
+of pages that do not print the figure, and 2 bracket mismatches. Four changes to
+the prompt in `ask.py`, each measured, brought that to 27 / 28, and a citation
+check in code brought it to 28:
+
+1. **The chunk number was being cited as the page.** Context excerpts were
+   labelled `[chunk 6 | page 18]`, and every one of six wrong citations checked
+   was the chunk number of the excerpt holding the figure: "(page 6)" for the
+   figure in chunk 6. Labels now carry the page only. Shipped with a first
+   rewrite of the source rules, this took the score from 10 to 26 and removed
+   every citation of a page that does not print the figure but one.
+2. **Primary statements are marked in the label, not listed in the prompt.**
+   Excerpts from pages 62–66 are labelled `[page 62 | PRIMARY STATEMENT:
+   Consolidated income statement]`. Listing those pages in the prompt instead
+   made the model cite "page 62" for EBITDA in every run, with page 62 not in
+   the context. The prompt now contains no page numbers at all.
+3. **Sources are not described in prose.** Asked to name the table a figure
+   came from, the model kept crediting key figures to "the consolidated income
+   statement", however the rule was worded. Answers now cite `(page N)` and
+   nothing else. No graded answer since has named a statement it did not use.
+4. **No bracketed originals.** "€ 19.37 billion (19,374,073 thousand EUR)" was
+   the least reliable part of an answer across four prompt versions. The
+   brackets carried a neighbouring row, the other year's column, the wrong unit,
+   or digits printed nowhere in the report. Answers now give the converted
+   figure only, and the page citation is how a reader checks it.
+
+5. **Citations are checked in code** (`citations.py`). One miss survived every
+   prompt version. 2024 turnover was correctly given as € 14.85 billion but
+   cited to page 149, an EU Taxonomy table whose "Turnover" row sits beside
+   "previous financial year (2024)" and prints 2025's figure. A prompt rule
+   telling the model to check the digits changed nothing in two runs and was
+   removed.
+
+   So after each answer, every `(page N)` is checked against the excerpts the
+   model was given. If the excerpt from page N does not print the figure before
+   the citation, and another excerpt does, the citation is moved there;
+   otherwise it is left as written. A page that prints the figure exactly
+   (`14,853,681` for € 14.85 billion) beats one that only states it more
+   coarsely. Without that ordering, "€ 1.03 billion" of 2024 EBITDA was moved
+   to page 12, whose "€ 1.0 billion" is a 2028 target, instead of to page 18,
+   which prints `(1,025)`.
+
+   Before shipping, the check was replayed over the 434 answers saved from this
+   work's evaluation runs. It changed 25 citations, fixed 11 that were wrong,
+   broke none, and every new page prints the case's figure exactly.
+
+   `evaluate.py` grades citations with its own implementation rather than
+   importing this one, so a bug in the check shows up as a failure instead of
+   being shared by the code and its test. Both do rest on the same idea of what
+   counts as a page printing a figure.
+
+Prompt rules here are kept only with a measurement behind them.
+
+The grader was tightened during the same work. It gained `invented_originals()`
+and a check for six-digit raw euro amounts like "€ 771,739", and lost two false
+failures: half-up rounding, and pages that state an amount at their own
+rounding. So the intermediate scores were not all taken with an identical
+grader. The final 28 / 28 is from the grader as committed.
 
 Vector-only last scored 17 of the 22 cases that existed before the half-year
 section was added, and every one of those failures was a page it never
@@ -477,13 +621,13 @@ the new retrieval hold up, not as a re-run of that measurement.
 
 The statement tables (pages ~85–200) print bare numbers under a `Thousands of
 EUR` header, so the turnover row reads `19,374,073`. The prompt makes the model
-find that header and convert, giving *"€ 19.37 billion (19,374,073 thousand
-EUR)"* rather than the 1000-fold understatement *"€ 19,374,073"*. Figures the
-report already states in prose (*"€ 847 million"*) are quoted as written.
+find that header and convert, giving *"€ 19.37 billion"* rather than the
+1000-fold understatement *"€ 19,374,073"*. Figures the report already states in
+prose (*"€ 847 million"*) are quoted as written.
 
-Page citations are usually right but can drift to a neighbouring table when
-several similar tables are retrieved at once. The `SOURCES` list under each
-answer is the reliable place to check.
+Each figure is cited as *(page N)*. In the graded runs, 28 of 28 answers cite a
+page that prints the figure (see *Citations and sources*). The `SOURCES` list
+under each answer shows the exact excerpts it was written from.
 
 ### Table headers are carried onto their rows
 
@@ -585,7 +729,7 @@ This repo is already deployed on Streamlit Community Cloud:
 | Tracks | branch `main`, entry point `app.py` |
 | Python | 3.11 |
 | Visibility | **Settings → Sharing**: *public and searchable* — no Streamlit account needed to open it |
-| Secrets | `OPENAI_API_KEY`, `APP_PASSWORD` — set in the app's **Settings → Secrets**, never in the repo |
+| Secrets | `OPENAI_API_KEY`, `APP_PASSWORD`, and optionally `COHERE_API_KEY` (and `COHERE_RERANK_MODEL`) — set in the app's **Settings → Secrets**, never in the repo |
 
 Those last two work together, and it is worth being clear which does what.
 Streamlit's sharing setting decides who may **load** the app; `APP_PASSWORD`
@@ -626,8 +770,9 @@ git commit -m "..."
 git push
 ```
 
-- `app.py` imports `ask.py`, which imports `retrieval.py`, which is imported
-  alongside `chunking.py` — miss one and the deploy dies with `ModuleNotFound`.
+- `app.py` imports `ask.py`, which imports `retrieval.py`, `citations.py` and
+  `rerank.py`; `retrieval.py` imports `rerank.py` too, and is imported alongside
+  `chunking.py` — miss one and the deploy dies with `ModuleNotFound`.
 - **The store is a directory, not a file.** Every rebuild writes a new
   UUID-named segment folder under `chroma_db/`; `git add -A` picks it up,
   `git add *.py` does not. A store missing its segment folder opens without
@@ -729,6 +874,17 @@ Retrieval, at the top of `retrieval.py`:
 The two weights are the lever to reach for when answers miss in a way that is
 characteristically one retriever's fault: keyword misses argue for more BM25,
 paraphrase misses for more vector.
+
+Reranking for semantic-only search, in `retrieval.py`, `rerank.py` and the
+environment:
+
+| Name | Default | Purpose |
+| --- | --- | --- |
+| `COHERE_API_KEY` (env / secret) | unset | Turns Cohere Rerank on for semantic-only search. Unset, that mode is plain embedding search |
+| `COHERE_RERANK_MODEL` (env / secret) | `rerank-v4.0-pro` | Rerank model. `rerank-v4.0-fast` trades some quality for latency |
+| `RERANK_CANDIDATES` | 50 | Embedding candidates per query handed to the reranker. The wrongly answered cases had their answer at 16th–38th |
+| `TIMEOUT_SECONDS` / `MAX_RETRIES` | 15 / 3 | Per-request timeout, and retries on 429 or 5xx before falling back to embedding order |
+| `COHERE_CALLS_PER_MINUTE` (env) | unset in the app; 10 in `evaluate.py` | Spaces rerank calls evenly to stay under a rate limit. A trial key allows 10 a minute |
 
 Chunking, at the top of `chunking.py` — these only take effect on a rebuild:
 

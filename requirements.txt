@@ -13,6 +13,12 @@ chromadb==1.5.9
 # own to a deployment.
 rank-bm25==0.2.2
 
+# Cohere Rerank for semantic-only search (rerank.py) is one HTTP request, made
+# with httpx. The OpenAI client already installs it; it is pinned here because
+# rerank.py imports it directly, and to the version that client resolved to.
+# Cohere's SDK is deliberately not used - see rerank.py.
+httpx==0.28.1
+
 streamlit==1.61.1
 
 # Linux only, and only for deployment: chromadb needs sqlite >= 3.35 and some

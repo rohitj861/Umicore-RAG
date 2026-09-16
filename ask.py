@@ -26,6 +26,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
+from citations import correct_citations
+from rerank import CohereReranker
 from retrieval import HybridRetriever
 
 PERSIST_DIR = "chroma_db"
@@ -87,6 +89,25 @@ LIST_MARKER = re.compile(r"^\s*(?:[-*•]|\d{1,2}[.)])\s+")
 # the instruction or be copied back wholesale.
 HISTORY_EXCERPT = 400
 
+# The report's primary financial statements, by the page number answers cite -
+# taken from the PDF's bookmarks. An excerpt from one of these pages is
+# labelled with the statement's name in the context (see _format_context), so
+# whether a figure comes from a primary statement is read off the label rather
+# than remembered from the prompt.
+#
+# Stated in the prompt as a page list instead, the model cited "consolidated
+# income statement (page 62)" for 2024 EBITDA in every run, with page 62 not
+# even in the context - the list itself was the source of the page number. And
+# it cannot be recognised from the page text: pages 61-67 all print the names
+# of all five statements in their navigation bar.
+PRIMARY_STATEMENTS = {
+    62: "Consolidated income statement",
+    63: "Consolidated statement of comprehensive income",
+    64: "Consolidated balance sheet",
+    65: "Consolidated statement of changes in equity",
+    66: "Consolidated statement of cash flows",
+}
+
 SYSTEM_PROMPT = (
     "You answer questions about the Umicore Annual Report 2025 using ONLY the "
     "context extracted from that PDF.\n\n"
@@ -98,15 +119,22 @@ SYSTEM_PROMPT = (
     # 2024 profit before income tax, the model took note F13's 1,375,542 -
     # consolidated companies only - over the income statement's 1,424,122,
     # even with the income statement sitting in the context.
+    # Primary statements are recognised by the excerpt label, which
+    # _format_context writes from PRIMARY_STATEMENTS. Recognised by heading,
+    # they matched every page from 61 to 67 - all print all five names in
+    # their navigation bar - and the model credited key figures, segment
+    # tables and notes to the income statement in 12 of 28 graded answers.
+    # No page numbers appear here: a page listed in the prompt was cited as a
+    # source even when it was not in the context.
     "READ THIS FIRST. Some lines appear twice in the context: once in a "
-    "PRIMARY STATEMENT - a chunk headed 'Consolidated income statement', "
-    "'Consolidated balance sheet' or 'Consolidated statement of cash flows' - "
-    "and again in a NOTE, headed by F and a number ('F13 Income taxes') or by "
-    "'RELATIONSHIP BETWEEN'. The note's version is a differently-scoped "
-    "subtotal, not the same number. Before answering with any figure, scan the "
-    "whole context for a primary statement carrying that line; if one is "
-    "there, use ITS figure and say which statement it came from. Never answer "
-    "from the note because it appeared first, or more often.\n\n"
+    "PRIMARY STATEMENT and again in a NOTE, headed by F and a number ('F13 "
+    "Income taxes') or by 'RELATIONSHIP BETWEEN'. The note's version is a "
+    "differently-scoped subtotal, not the same number. An excerpt is a "
+    "primary statement ONLY if its label says so, e.g. '[page N | PRIMARY "
+    "STATEMENT: Consolidated income statement]'. Before answering with any "
+    "figure, scan the context for an excerpt labelled PRIMARY STATEMENT that "
+    "carries that line; if one is there, use ITS figure. Never answer from "
+    "the note because it appeared first, or more often.\n\n"
     "Rules:\n"
     "1. If the context answers NONE of the question, reply with exactly: "
     f'"{UNKNOWN_ANSWER}" and nothing else.\n'
@@ -125,9 +153,23 @@ SYSTEM_PROMPT = (
     "   - under 'Thousands of EUR': divide by 1,000 for € million, by "
     "1,000,000 for € billion;\n"
     "   - under 'Millions of EUR': divide by 1,000 for € billion.\n"
-    "   Write the converted value, then the original in brackets. The row "
-    "'Turnover 19,374,073' under 'Thousands of EUR' must be written as "
-    "'€ 19.37 billion (19,374,073 thousand EUR)'.\n"
+    # Answers used to add the table's original in brackets - "€ 19.37 billion
+    # (19,374,073 thousand EUR)" - and across four graded runs the bracket
+    # was the least reliable thing in them, however the rule was worded: a
+    # neighbouring row's figure ("€ 385 million (389,501 thousand EUR)"), the
+    # other year's column, the wrong unit ("€ 4.48 billion (4,482 thousand
+    # EUR)"), and originals printed nowhere in the report ("(763,000 thousand
+    # EUR)" beside a key figure in millions). The page citation already lets a
+    # reader check the figure, so the bracket is no longer asked for.
+    "   Write ONLY the converted value, with no bracketed original after it. "
+    "The row 'Turnover 19,374,073' under 'Thousands of EUR' is written "
+    "'€ 19.37 billion'; 'attributable to Group share 384,548' is "
+    "'€ 385 million'. Do not add '(19,374,073 thousand EUR)' or any other "
+    "restatement of the figure in brackets - the page citation is how a "
+    "reader checks it.\n"
+    "   Every figure gets this treatment, including each item of a bulleted "
+    "list: '€ 771,739' is WRONG in a list exactly as it is in a sentence - "
+    "it is '€ 771.74 million'.\n"
     "   NEVER write the raw digits straight after a euro sign: "
     "'€ 19,374,073' is WRONG because it understates the amount 1000-fold. "
     "Any euro amount you write must carry the word million or billion unless "
@@ -136,11 +178,15 @@ SYSTEM_PROMPT = (
     "is unclear rather than assuming.\n"
     "   BRACKETS MEAN NEGATIVE, AND CONVERT EXACTLY AS A POSITIVE DOES. "
     "'(1,424,122)' under 'Thousands of EUR' is a LOSS of € 1.42 billion, and "
-    "must be written 'a loss of € 1.42 billion (1,424,122 thousand EUR)' or "
-    "'€ -1.42 billion'. Writing '€ (1,424,122) million' is WRONG twice over: "
+    "must be written 'a loss of € 1.42 billion' or '€ -1.42 billion'. "
+    "Writing '€ (1,424,122) million' is WRONG twice over: "
     "it keeps the raw thousands and labels them millions. Carry the sign into "
     "words - say 'loss' or use a minus sign - and never leave brackets round "
     "an unconverted figure.\n"
+    "   The sign must survive into the converted value itself. The row "
+    "'EBITDA 244 781 (1,025) 1,212' under '(in million €)' gives full-year "
+    "2024 EBITDA of 'a loss of € 1.03 billion' or '€ -1.03 billion'. Writing "
+    "'€ 1.03 billion' is WRONG: it reports a loss as a profit.\n"
     "7. TABLE HEADER LINES. A chunk may begin with '[page N table header: "
     "...]'. That is the units and column layout of the table the rows below it "
     "came from, restored because the extraction separated it from those rows. "
@@ -166,7 +212,7 @@ SYSTEM_PROMPT = (
     "524,279' gives 2024 Total = 14,853,681 and 2025 Total = 19,374,073 - the "
     "first three figures are 2024, the next three 2025.\n"
     "   Prefer a plain statement table over an adjustments or reconciliation "
-    "table when both are present, and say which you used.\n"
+    "table when both are present.\n"
     "   If you cannot tell which column belongs to the year asked, say the "
     "figure is ambiguous and name the candidates. NEVER pick a column because "
     "it looks plausible - a figure reported against the wrong year is worse "
@@ -176,9 +222,8 @@ SYSTEM_PROMPT = (
     "is 847; the Catalysis figure on the same row label is 450, and "
     "Recycling's is 371. Reporting one as the other is a large error.\n"
     "   The scopes, and how to recognise each from the table header:\n"
-    "   - the GROUP total - 'Group key figures', and the consolidated "
-    "statements ('Consolidated income statement', 'Consolidated balance "
-    "sheet');\n"
+    "   - the GROUP total - 'Group key figures', and the excerpts labelled "
+    "PRIMARY STATEMENT;\n"
     "   - one business group - 'Battery Materials Solutions key figures', "
     "'Catalysis key figures', 'Recycling key figures', 'Specialty Materials "
     "key figures';\n"
@@ -198,12 +243,12 @@ SYSTEM_PROMPT = (
     "context. NEVER pass a business group's or a consolidated-companies "
     "figure off as the Group total.\n"
     "   - THE PRIMARY STATEMENTS OUTRANK THE NOTES. When the same line "
-    "appears both in a primary statement ('Consolidated income statement', "
-    "'Consolidated balance sheet', 'Consolidated statement of cash flows') "
-    "and in a note - a header starting with F and a number, such as 'F13 "
-    "Income taxes' - or under a heading containing 'RELATIONSHIP BETWEEN' or "
-    "'reconciliation', report the PRIMARY STATEMENT's figure and name that "
-    "statement. The note's variant is usually a differently-scoped subtotal "
+    "appears both in a primary statement (an excerpt labelled PRIMARY "
+    "STATEMENT) and in a note - a "
+    "header starting with F and a number, such as 'F13 Income taxes' - or "
+    "under a heading containing 'RELATIONSHIP BETWEEN' or 'reconciliation', "
+    "report the PRIMARY STATEMENT's figure, cited by its page. The "
+    "note's variant is usually a differently-scoped subtotal "
     "on the way to it. For 2025, the consolidated income statement gives "
     "profit before income tax of 771,739; note F13 gives 845,345 for "
     "consolidated companies only. The first is the answer to an unscoped "
@@ -223,8 +268,34 @@ SYSTEM_PROMPT = (
     "the answer. Equally, never offer turnover as a stand-in for revenue, or "
     "revenue as a stand-in for turnover - if the one asked for is genuinely "
     "absent, say so without substituting the other.\n"
-    "11. Cite the page number(s) you used, e.g. (page 12).\n"
-    "12. Be concise; use bullet points when listing several facts."
+    # Each excerpt used to be labelled "[chunk 6 | page 18]", and the model
+    # cited the chunk number: every one of six wrong citations measured was
+    # the index of the chunk holding the figure. The label now carries only
+    # the page - and, for a primary statement, its name - and the citation is
+    # the label copied.
+    # Page only in the citation. Asked to copy the whole label, the model also
+    # invented labels - "(page 18, PRIMARY STATEMENT: Group key figures)" -
+    # calling a key figures table a primary statement.
+    "11. CITATIONS. Every excerpt in the context starts with a label such as "
+    "'[page N]'. After each figure, cite the page number from the label of "
+    "the excerpt you took it from, written exactly '(page N)' - nothing else "
+    "inside the brackets. The label is the ONLY valid source of a page "
+    "number: never cite a number from anywhere else, and never cite a page "
+    "you did not take the figure from. If you use figures from several "
+    "excerpts, cite each figure's own page.\n"
+    # Asked to name the source table, the model named a primary statement
+    # for key figures in run after run, whatever the rule said about which
+    # excerpts are statements - "from the consolidated income statement"
+    # appears to be its default phrasing for any financial figure. With
+    # sources not described in prose, no graded run has repeated it.
+    "12. SOURCES. Do NOT describe where a figure comes from in your own "
+    "words - no 'from the consolidated income statement', 'as reported in "
+    "the Group key figures', 'from the consolidated statements'. The page "
+    "citation in rule 11 is the whole of the source. Name a statement or "
+    "note only to tell two differently-scoped figures apart, as rule 9 "
+    "asks, and then only one whose excerpt is in the context - a primary "
+    "statement only if its label says PRIMARY STATEMENT.\n"
+    "13. Be concise; use bullet points when listing several facts."
 )
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
@@ -319,8 +390,16 @@ def _page_label(doc: Document) -> str:
 
 def _format_context(docs: list[Document]) -> str:
     blocks = []
-    for i, doc in enumerate(docs, start=1):
-        blocks.append(f"[chunk {i} | page {_page_label(doc)}]\n{doc.page_content}")
+    for doc in docs:
+        # No chunk index: one here was cited as if it were the page - see
+        # rule 11 of SYSTEM_PROMPT. A primary statement says so in its label,
+        # which is the only way the prompt lets the model recognise one.
+        page = _page_label(doc)
+        statement = PRIMARY_STATEMENTS.get(int(page)) if page.isdigit() else None
+        label = f"page {page}"
+        if statement:
+            label += f" | PRIMARY STATEMENT: {statement}"
+        blocks.append(f"[{label}]\n{doc.page_content}")
     return "\n\n".join(blocks)
 
 
@@ -445,7 +524,11 @@ def open_retriever() -> HybridRetriever:
     index reads every chunk's text out of the store, which takes a second or
     two at start-up - hence one retriever per process, held by the caller.
     """
-    return HybridRetriever(open_vectorstore())
+    # open_vectorstore() loads .env, so the reranker is built after it and
+    # sees COHERE_API_KEY. Without the key it stays disabled, and semantic-only
+    # search runs as plain vector search.
+    vectordb = open_vectorstore()
+    return HybridRetriever(vectordb, reranker=CohereReranker())
 
 
 class PdfChatbot:
@@ -472,6 +555,10 @@ class PdfChatbot:
         self.use_bm25 = use_bm25
         self.llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
         self.chat_history: list = []
+        # What the last search did beyond finding chunks - for semantic-only
+        # search, whether Cohere reranked them. Kept per bot because the
+        # retriever is shared between sessions.
+        self.last_search: dict = {}
 
     def reset(self) -> None:
         """Forget the conversation so far."""
@@ -520,11 +607,17 @@ class PdfChatbot:
         get added up, and how the same arithmetic stops one sub-question of a
         multi-part question filling every slot.
 
-        With `use_bm25` off the keyword half is skipped and this is a plain
-        vector search - the behaviour this project shipped before fusion.
+        With `use_bm25` off the keyword half is skipped and this is semantic
+        search: embedding similarity, reranked by Cohere Rerank when
+        COHERE_API_KEY is set, and plain embedding order when it is not or the
+        call fails. `last_search` records which.
         """
+        self.last_search = {}
         return self.retriever.search(
-            queries, limit=MAX_CONTEXT_CHUNKS, use_bm25=self.use_bm25
+            queries,
+            limit=MAX_CONTEXT_CHUNKS,
+            use_bm25=self.use_bm25,
+            info=self.last_search,
         )
 
     def _remember(self, question: str, answer: str) -> None:
@@ -547,6 +640,10 @@ class PdfChatbot:
                 }
             )
             answer = response.content.strip() or UNKNOWN_ANSWER
+            # The prompt asks for the right page; this makes sure of it where
+            # the excerpts can tell. A citation whose page does not print the
+            # figure is moved to one that does - see citations.py.
+            answer, _ = correct_citations(answer, docs)
             # Don't show sources for an answer that isn't in the PDF.
             sources = [] if _is_unknown(answer) else docs
 

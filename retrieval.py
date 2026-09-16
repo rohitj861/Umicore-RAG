@@ -32,6 +32,8 @@ import re
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
+from rerank import RerankError
+
 # Chunks fetched per retriever, per search query. This is the size of the
 # candidate pool, not of the context: ask.MAX_CONTEXT_CHUNKS caps what actually
 # reaches the model, so raising it buys better candidates to fuse without
@@ -45,6 +47,13 @@ from rank_bm25 import BM25Okapi
 # at 24 page 87 is crowded back out.
 TOP_K = 16
 RRF_K = 60  # the K above: the rank at which a hit is worth half of rank 0
+
+# Candidates the first stage of semantic-only search hands to Cohere Rerank,
+# per query. Semantic-only ranked the chunk printing the answer 16th to 38th
+# on the graded questions it got wrong, so the pool has to reach well past
+# TOP_K for a reranker to have that chunk to promote. The reranker still
+# returns only TOP_K, so the context the model sees does not grow.
+RERANK_CANDIDATES = 50
 
 # BM25 is weighted slightly higher, and only to settle ties. Where the two
 # retrievers return no chunk in common - which is what an exact-string query
@@ -236,7 +245,11 @@ def limit_per_page(
 
 
 class HybridRetriever:
-    """Vector search and BM25 over one store, fused into a single ranking."""
+    """Vector search and BM25 over one store, fused into a single ranking.
+
+    With `use_bm25=False` it is semantic-only search instead: vector search,
+    reranked by `reranker` when one is configured.
+    """
 
     def __init__(
         self,
@@ -247,6 +260,8 @@ class HybridRetriever:
         vector_weight: float = VECTOR_WEIGHT,
         bm25_weight: float = BM25_WEIGHT,
         max_per_page: int = MAX_PER_PAGE,
+        reranker=None,
+        rerank_candidates: int = RERANK_CANDIDATES,
     ):
         self.vectordb = vectordb
         self.bm25 = bm25 if bm25 is not None else BM25Index.from_chroma(vectordb)
@@ -255,9 +270,37 @@ class HybridRetriever:
         self.vector_weight = vector_weight
         self.bm25_weight = bm25_weight
         self.max_per_page = max_per_page
+        self.reranker = reranker
+        self.rerank_candidates = rerank_candidates
+
+    def _semantic_ranking(self, query: str, info: dict) -> list[Document]:
+        """One query's semantic-only ranking: embeddings, then Cohere Rerank.
+
+        Without a usable reranker - none configured, no key, or a failed call -
+        this is exactly the plain vector search the mode ran before reranking:
+        the top `k` by embedding similarity. `info` records which happened, per
+        call, because the retriever is shared and cannot hold it itself.
+        """
+        if self.reranker is None or not self.reranker.enabled:
+            info.setdefault("rerank", "off: COHERE_API_KEY is not set")
+            return self.vectordb.similarity_search(query, k=self.k)
+
+        candidates = self.vectordb.similarity_search(query, k=self.rerank_candidates)
+        try:
+            ranking = self.reranker.rerank(query, candidates, top_n=self.k)
+        except RerankError as exc:
+            info["rerank"] = f"failed, used embedding order: {exc}"
+            return candidates[: self.k]
+
+        info.setdefault("rerank", f"reranked by {self.reranker.model}")
+        return ranking
 
     def search(
-        self, queries: list[str], limit: int, use_bm25: bool = True
+        self,
+        queries: list[str],
+        limit: int,
+        use_bm25: bool = True,
+        info: dict | None = None,
     ) -> list[Document]:
         """The best `limit` chunks across every query and both retrievers.
 
@@ -278,10 +321,21 @@ class HybridRetriever:
         still more than one ranking to merge. On a single query fusion over one
         ranking is order-preserving - score falls monotonically with rank - so
         the result is exactly that ranking, untouched.
+
+        Semantic-only search reranks each query's candidates with Cohere
+        Rerank before fusion - see _semantic_ranking. Reranking per query, not
+        once over everything, keeps what fusion does for a multi-part question:
+        each sub-question's best chunk still counts the same. Pass a dict as
+        `info` to learn whether reranking happened; hybrid search leaves it
+        untouched, and never calls the reranker.
         """
+        info = {} if info is None else info
         rankings, weights = [], []
         for query in queries:
-            rankings.append(self.vectordb.similarity_search(query, k=self.k))
+            if use_bm25:
+                rankings.append(self.vectordb.similarity_search(query, k=self.k))
+            else:
+                rankings.append(self._semantic_ranking(query, info))
             weights.append(self.vector_weight)
             if use_bm25:
                 rankings.append(self.bm25.search(query, k=self.k))
