@@ -589,11 +589,17 @@ failures: half-up rounding, and pages that state an amount at their own
 rounding. So the intermediate scores were not all taken with an identical
 grader. The final 28 / 28 is from the grader as committed.
 
-Vector-only last scored 17 of the 22 cases that existed before the half-year
-section was added, and every one of those failures was a page it never
-retrieves — the Group key figures for adjusted EBITDA, the consolidated income
-statement for profit before income tax. That gap is the clearest measured
-argument for the hybrid default, and the reason hybrid is the default.
+Vector-only once scored 17 of the 22 cases that existed before the half-year
+section was added. Later diagnosis showed those misses were pages it ranks too
+low rather than pages it never finds: the Group key figures for adjusted
+EBITDA, the consolidated income statement for profit before income tax. That is
+what *Semantic only, reranked* fixes, and with Cohere Rerank semantic-only
+search now scores 28 / 28 as well.
+
+Hybrid stays the default all the same. It reaches 28 / 28 with no second
+provider, no second API key and no rate limit to fall back from, and it sends
+no report text outside OpenAI. Semantic only matches it only while Cohere
+answers.
 
 ### What was measured after the change
 
