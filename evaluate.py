@@ -15,6 +15,11 @@ contains the right one and none of the wrong ones - so a plausible answer drawn
 from the wrong column, the wrong business group or the wrong statement fails
 rather than passing on a keyword.
 
+The right figure is not enough on its own, either. An answer also fails when
+the original it gives in brackets is a different amount from the converted
+figure, when a page it cites prints none of its figures, or when it credits a
+primary statement that does not print the figure. See grade().
+
 Ground truth is the Group key figures table on page 18 (full-year columns), the
 segment tables on pages 19-24, and the consolidated income statement on page
 62. Everything here was read off those pages by hand; re-check them against the
@@ -112,6 +117,227 @@ def mentions(answer: str, wanted) -> bool:
         for form in spellings(wanted)
     )
 
+
+# --- Checks on what surrounds the figure ---------------------------------------
+#
+# An answer can state the right figure and still be wrong about it. Each case
+# below passed the checks above in a measured run:
+#
+#   "€ 385 million (389,501 thousand EUR)" - the headline is Group share, the
+#       bracket is total profit including minorities, a different row;
+#   "€ -1.03 billion (1,025 thousand EUR)" - the bracket is a thousandfold out;
+#   "adjusted EBITDA ... € 847 million ... (page 6)" - page 6 does not print it;
+#   "gearing ratio ... from the consolidated balance sheet" - it is a key
+#       figure, and the balance sheet does not print it.
+#
+# The first two are caught by comparing the two halves of the pair, the last
+# two by looking at the pages the answer credits.
+
+NUMBER = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
+SCALES = {"thousand": 1e3, "million": 1e6, "billion": 1e9}
+
+# A converted figure followed by the original in brackets, as rule 6 of the
+# prompt asks for: "€ 19.37 billion (19,374,073 thousand EUR)". Signs and
+# accounting brackets are allowed on either side; only magnitudes are compared.
+FIGURE_PAIR = re.compile(
+    rf"(?:€|\bEUR)\s*[-−–]?\s*\(?(?P<a>{NUMBER})\)?\s*(?P<a_scale>thousand|million|billion)\b"
+    rf"(?:\s*(?:EUR|€))?\s*"
+    rf"\(\s*[-−–]?\s*\(?(?P<b>{NUMBER})\)?\s*(?P<b_scale>thousand|million|billion)\b[^)]*\)",
+    re.I,
+)
+
+
+def _amount(number: str, scale: str) -> tuple[float, float]:
+    """(value in EUR, how far the written rounding lets it be from the truth)."""
+    decimals = len(number.split(".")[1]) if "." in number else 0
+    multiplier = SCALES[scale.lower()]
+    return (
+        float(number.replace(",", "")) * multiplier,
+        0.5 * 10 ** -decimals * multiplier,
+    )
+
+
+def pair_errors(answer: str) -> list[str]:
+    """Converted figures whose bracketed original is a different amount.
+
+    Two ways this goes wrong, and one check covers both: the bracket carries
+    another row's figure, or it carries the right digits under the wrong scale
+    word. Either way the two halves stop describing the same amount.
+
+    The allowance is the rounding each side is written to - "€ 385 million"
+    may stand for anything from 384.5 to 385.5 million - so a correct pair
+    always passes and a pair that is off by more than its own precision does
+    not. 389,501 thousand is 4.5 million away from "385 million", and 1,025
+    thousand is a billion away from "1.03 billion".
+    """
+    found = []
+    for match in FIGURE_PAIR.finditer(answer):
+        headline, headline_slack = _amount(match["a"], match["a_scale"])
+        original, original_slack = _amount(match["b"], match["b_scale"])
+        slack = headline_slack + original_slack
+        if abs(headline - original) > slack * (1 + 1e-9):
+            found.append(match.group(0))
+    return found
+
+
+# Where the primary statements are, from the PDF's own bookmarks. Their names
+# cannot be looked for in the page text instead: pages 61-67 all carry every
+# statement's name in their navigation, so the text would vouch for any of
+# them.
+STATEMENT_PAGES = {
+    "consolidated income statement": 62,
+    "consolidated statement of comprehensive income": 63,
+    "consolidated balance sheet": 64,
+    "consolidated statement of changes in equity": 65,
+    "consolidated statement of cash flows": 66,
+    "consolidated cash flow statement": 66,
+}
+STATEMENT = re.compile(
+    "|".join(re.escape(name) for name in STATEMENT_PAGES), re.I
+)
+
+# "(page 18)", "pages 19-24", "pages 62 and 90". A page number is at most three
+# digits and never runs straight into a fourth, so "page 62, 2025" reads as
+# page 62 alone.
+CITATION = re.compile(
+    r"\bpages?\s+((?:\d{1,3}(?!\d)(?:\s*(?:,|and|&|[-–]|to)\s*)?)+)", re.I
+)
+CITED_PAGE = re.compile(r"(\d{1,3})(?:\s*(?:[-–]|to)\s*(\d{1,3}))?")
+
+# Figures as the answer writes them, for crediting a page with a figure the
+# case did not ask about. Years are left out: every page of this report prints
+# 2025.
+ANSWER_FIGURE = re.compile(r"(?<![\d.,])(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d{3,})(?![\d])")
+YEAR = re.compile(r"(?:19|20)\d{2}")
+
+# A statement named only to set it aside - "not the consolidated income
+# statement", "unlike the balance sheet" - is not a claim about the source.
+NEGATION = re.compile(r"\b(?:not|unlike|rather than|instead of|differs? from)\b", re.I)
+
+
+def printed_forms(expected: list) -> set[str]:
+    """How the report prints each expected figure: 384548 -> "384,548"."""
+    return {
+        wanted if isinstance(wanted, str) else f"{wanted:,}"
+        for wanted in expected
+    }
+
+
+def prints(text: str, forms: set[str]) -> bool:
+    """Whether a page prints any of these figures, as a whole number.
+
+    Bounded both sides, and a trailing decimal counts as a different number:
+    "847" is not printed by "1,847" or by "847.3".
+    """
+    return any(
+        re.search(r"(?<![\d,.])" + re.escape(form) + r"(?![\d]|[.,]\d)", text)
+        for form in forms
+    )
+
+
+def cited_pages(answer: str) -> list[range]:
+    """Every page citation in the answer, a single page as a range of one."""
+    cited = []
+    for citation in CITATION.finditer(answer):
+        for first, last in CITED_PAGE.findall(citation.group(1)):
+            low = int(first)
+            high = int(last) if last else low
+            if low <= high <= low + 20:  # a wider span is not a citation
+                cited.append(range(low, high + 1))
+    return cited
+
+
+def citation_errors(answer: str, expected: list, page_text: dict[int, str]) -> list[str]:
+    """Cited pages that print neither the figure asked for nor any the answer gives.
+
+    A page passes on any figure the answer states, not only the one the case
+    asked about: an answer may cite a second page for a comparison figure, and
+    that citation is right. What fails is a page that prints nothing the answer
+    says - which is what "(page 6)" for adjusted EBITDA was. A range passes if
+    any page in it prints one.
+
+    Converted figures ("1.42 billion") are never printed by the report; the
+    bracketed original beside them is what matches.
+    """
+    cited = cited_pages(answer)
+    if not cited:
+        return []
+
+    page_numbers = {str(page) for pages in cited for page in pages}
+    forms = printed_forms(expected) | {
+        figure
+        for figure in ANSWER_FIGURE.findall(answer)
+        if not YEAR.fullmatch(figure) and figure not in page_numbers
+    }
+
+    found = []
+    for pages in cited:
+        if not any(prints(page_text.get(page, ""), forms) for page in pages):
+            label = f"{pages.start}-{pages.stop - 1}" if len(pages) > 1 else str(pages.start)
+            found.append(f"page {label}")
+    return found
+
+
+def attribution_errors(answer: str, expected: list, page_text: dict[int, str]) -> list[str]:
+    """Primary statements named as a source that do not print the figure.
+
+    Stricter than citation_errors on purpose: the named statement must print
+    one of the case's own figures, not just any figure in the answer. Calling
+    a key figure "from the consolidated income statement" is the claim being
+    tested, and the income statement prints hundreds of numbers - letting any
+    of them vouch for it would pass almost everything.
+    """
+    forms = printed_forms(expected)
+    found = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n", answer):
+        for match in STATEMENT.finditer(sentence):
+            if NEGATION.search(sentence[: match.start()]):
+                continue
+            name = match.group(0).lower()
+            if not prints(page_text.get(STATEMENT_PAGES[name], ""), forms):
+                found.append(f"{name} (page {STATEMENT_PAGES[name]})")
+    return list(dict.fromkeys(found))
+
+
+def page_texts(retriever) -> dict[int, str]:
+    """All of each page's chunk text, keyed by the page number answers cite.
+
+    Taken from the store rather than the PDF, which a clone may not have. The
+    table headers ingest.py prepends to chunks carry units and years, not
+    figures, so they cannot vouch for a page that does not print the figure.
+    """
+    pages: dict[int, list[str]] = {}
+    for doc in retriever.bm25.documents:
+        page = doc.metadata.get("page")
+        if isinstance(page, int):
+            pages.setdefault(page + 1, []).append(doc.page_content)
+    return {page: "\n".join(texts) for page, texts in pages.items()}
+
+
+def grade(answer: str, expected: list, wrong: list, page_text: dict[int, str]) -> list[str]:
+    """Every problem with one answer, each prefixed with its kind. Empty = pass.
+
+    All checks run, not just the first to fail, so a report shows an answer
+    that has the wrong figure *and* cites the wrong page as both.
+    """
+    problems = []
+
+    if not any(mentions(answer, e) for e in expected):
+        problems.append(f"missing: none of {expected}")
+    miss = [str(w) for w in wrong if mentions(answer, w)]
+    if miss:
+        problems.append(f"wrong figure: reported {miss}")
+    for error in unit_errors(answer):
+        problems.append(f"unit: {error}")
+    for pair in pair_errors(answer):
+        problems.append(f"bracket: {pair!r} states two different amounts")
+    for page in citation_errors(answer, expected, page_text):
+        problems.append(f"citation: {page} prints none of the figures given")
+    for statement in attribution_errors(answer, expected, page_text):
+        problems.append(f"attribution: {statement} does not print {sorted(printed_forms(expected))}")
+
+    return problems
+
 # (question, right figures, figures that would be wrong, note)
 #
 # Figures are given as the report prints them; `spellings` handles the unit
@@ -207,6 +433,7 @@ OTHER = [
 
 def run(cases: list, modes: list[tuple[str, bool]]) -> tuple[int, int, list]:
     retriever = open_retriever()
+    page_text = page_texts(retriever)
     passed = total = 0
     failures = []
 
@@ -225,24 +452,19 @@ def run(cases: list, modes: list[tuple[str, bool]]) -> tuple[int, int, list]:
                 total += 1
                 continue
 
-            hit = any(mentions(answer, e) for e in expected)
-            miss = [str(w) for w in wrong if mentions(answer, w)]
-            units = unit_errors(answer)
-            ok = hit and not miss and not units
+            problems = grade(answer, expected, wrong, page_text)
+            ok = not problems
 
             total += 1
             passed += ok
             flag = "pass" if ok else "FAIL"
-            print(f"  [{label}] {flag}  {answer[:150].replace(chr(10), ' ')}")
-            if not ok:
-                if miss:
-                    reason = f"reported {miss}"
-                elif not hit:
-                    reason = f"none of {expected}"
-                else:
-                    reason = f"unit error: {units}"
-                print(f"         -> {reason}")
-                failures.append((question, label, reason))
+            # In full on a failure: the problem is often in the citation or
+            # the bracket at the end, which a truncated line cuts off.
+            shown = answer if problems else answer[:150]
+            print(f"  [{label}] {flag}  {shown.replace(chr(10), ' ')}")
+            for problem in problems:
+                print(f"         -> {problem}")
+                failures.append((question, label, problem))
 
     return passed, total, failures
 
@@ -265,7 +487,16 @@ def main() -> None:
     print("\n" + "=" * 70)
     print(f"{passed}/{total} passed")
     if failures:
-        print(f"\n{len(failures)} failure(s):")
+        # By kind first: a wrong figure and a wrong page citation are both
+        # failures, but not equally bad, and a run that only broke citations
+        # should read that way at a glance.
+        kinds: dict[str, int] = {}
+        for _, _, problem in failures:
+            kind = problem.split(":", 1)[0]
+            kinds[kind] = kinds.get(kind, 0) + 1
+        print("problems by kind: " + ", ".join(f"{k} {n}" for k, n in kinds.items()))
+
+        print(f"\n{len(failures)} problem(s):")
         for question, label, reason in failures:
             print(f"  [{label}] {question}\n         {reason}")
     sys.exit(1 if failures else 0)

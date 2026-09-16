@@ -382,6 +382,26 @@ not — `(1,424,122)` under *Thousands of EUR* came back as
 nothing about brackets, so it now spells out that brackets mean negative, that
 the conversion applies unchanged, and that the sign must be carried into words.
 
+**What surrounds the figure is checked too.** A right figure can still come
+with details that are wrong, and three checks catch them. Each was written for
+an answer that the checks above had passed:
+
+| Check | Fails an answer when | Measured example |
+| --- | --- | --- |
+| `pair_errors()` | the bracketed original is a different amount from the converted figure, beyond the rounding either side is written to | `€ 385 million (389,501 thousand EUR)`, where the bracket is total profit including minorities, not Group share; `€ -1.03 billion (1,025 thousand EUR)`, a thousandfold out |
+| `citation_errors()` | a cited page prints none of the figures the answer gives | adjusted EBITDA € 847 million "(page 6)"; the figure is on pages 8, 15, 16, 18, 26 and 50 |
+| `attribution_errors()` | a primary statement named as the source does not print the case's figure | gearing 37.4% "from the consolidated balance sheet"; it is a key figure (page 18) |
+
+Pages are read from the store, so the checks need no PDF. Statement pages are
+taken from the report's bookmarks (income statement 62 through cash flows 66),
+because pages 61–67 all print every statement's name in their navigation.
+
+A cited page is credited with any figure the answer states, so a second
+citation for a comparison year passes. A statement named only to set it
+aside ("not the Group total from the consolidated income statement") is not
+treated as a claim about the source. The summary counts problems by kind, so a
+run that only breaks citations reads that way at a glance.
+
 ### Half-year before full-year
 
 Fixing the brackets surfaced a second one, in the same place. The key figures
@@ -412,8 +432,18 @@ Current state, 28 cases:
 
 | Mode | Score |
 | --- | --- |
-| **Hybrid — vector + BM25** | **28 / 28** |
+| **Hybrid — vector + BM25** | **10 / 28** — every figure right; 18 answers fail on how they describe it |
 | Vector only | not re-measured since the suite grew |
+
+Hybrid scored 28 / 28 before the checks on what surrounds the figure were
+added, and the answers have not got worse since. The grader now counts errors
+it used to pass. In the first run under it, no answer gave a wrong figure, a
+missing figure or an unconverted unit. The failures were 12 wrong statement
+attributions (most often a key figure credited to the consolidated income
+statement), 10 citations of pages that do not print the figure, and 2 bracket
+mismatches. Every one was checked against the store and is real. The model's
+page citations have always been the weak part; the app's Sources panel shows
+the pages that were actually retrieved.
 
 Vector-only last scored 17 of the 22 cases that existed before the half-year
 section was added, and every one of those failures was a page it never
