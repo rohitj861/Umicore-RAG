@@ -64,6 +64,15 @@ own copy first:
 re-running never duplicates data and never accumulates dead segment folders.
 Committing the result replaces roughly 28 MB.
 
+Every chunk gets `section` and `chapter` metadata from the PDF's bookmarks,
+which the section filter matches against. For a store built before that, add
+them in place instead of rebuilding. Nothing is re-split or re-embedded, and it
+costs nothing:
+
+```powershell
+.\.venv\Scripts\python.exe ingest.py --tag-sections
+```
+
 ## Asking questions
 
 The chat UI is the same whether you open the hosted app or run it locally —
@@ -98,6 +107,34 @@ in both modes; that is the honest result, not a broken switch.
 
 Note that a bare figure typed on its own (`19,374,073`) is refused in *both*
 modes — the prompt answers questions, and a number alone is not one.
+
+### Filtering by section or page
+
+Below the search switch, the sidebar's **Filter** panel restricts which part of
+the report is searched:
+
+| Control | What it restricts to |
+| --- | --- |
+| **Report sections** | One or more chapters from the PDF's bookmarks — *Performance* (p. 13–27), *Corporate governance statement* (p. 28–60), *Financial statements* (p. 61–140), *Sustainability statements* (p. 141–204) and the smaller front and back sections. Empty means all. |
+| **Pages** | An inclusive page range, numbered as in the citations. |
+
+The two combine with AND, and the panel shows how many chunks are left to
+search — with a warning if a combination leaves none. Both retrievers get the
+same restriction, so hybrid and vector-only compare fairly under a filter.
+
+Use it when a question's wording belongs to more than one part of the report:
+*"adjusted EBITDA"* restricted to *Performance* keeps the segment tables and
+leaves out the notes. Like the search mode, the filter applies to the next
+question only, and each answer's Sources panel records the filter it ran
+under.
+
+A filtered **"I don't know about this."** only means the answer is not in the
+part searched, and the app says so under the reply. *Clear filters* widens the
+search back to the whole report.
+
+The sections are read from the store, not the PDF, so the hosted app offers
+them too. Sections are assigned per page: where a chapter starts part-way down
+a page, that whole page counts as the new chapter.
 
 Type **exit** (or `quit`, `bye`, `q`) to end the conversation; a *Start a new
 chat* button appears. On a local run, closing the browser tab leaves the server

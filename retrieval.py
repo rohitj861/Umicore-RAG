@@ -28,6 +28,7 @@ agreement between two different notions of relevance is what gets rewarded.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
@@ -114,6 +115,104 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
+@dataclass(frozen=True)
+class MetadataFilter:
+    """Restricts a search to part of the report, by the metadata on each chunk.
+
+    Two restrictions, combined with AND, each switched off by leaving it empty:
+
+    * `chapters` - the `chapter` values ingest.py writes from the PDF's
+      bookmarks ("Consolidated management report › Financial statements").
+      A chunk passes if its chapter is any of those listed.
+    * `first_page` / `last_page` - an inclusive range of 1-based page numbers,
+      the numbering the UI and every citation use. The store keeps pages
+      0-based, and the conversion happens here and nowhere else.
+
+    One object answers for both retrievers - `to_chroma` for the vector search,
+    `matches` for BM25 - so the two halves of a hybrid search can never be
+    restricted differently. If they were, fusion would reward a chunk only one
+    of them was allowed to see.
+
+    Frozen, because app.py rebuilds it from the sidebar on every question and
+    it is carried alongside the answer it produced; nothing should change it
+    after the fact.
+    """
+
+    chapters: tuple[str, ...] = ()
+    first_page: int | None = None
+    last_page: int | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.chapters) or self.first_page is not None or self.last_page is not None
+
+    def to_chroma(self) -> dict | None:
+        """The same restriction as a Chroma `where` clause, or None for none.
+
+        Chroma rejects an `$and` of fewer than two clauses, so a single clause
+        is returned bare.
+        """
+        clauses = []
+        if self.chapters:
+            clauses.append({"chapter": {"$in": list(self.chapters)}})
+        if self.first_page is not None:
+            clauses.append({"page": {"$gte": self.first_page - 1}})
+        if self.last_page is not None:
+            clauses.append({"page": {"$lte": self.last_page - 1}})
+
+        if not clauses:
+            return None
+        return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+    def matches(self, metadata: dict) -> bool:
+        """Whether a chunk with this metadata passes. Mirrors `to_chroma`.
+
+        A chunk with no chapter, or no usable page, fails any restriction on
+        that field - which is also what Chroma does with a missing key.
+        """
+        if self.chapters and metadata.get("chapter") not in self.chapters:
+            return False
+
+        if self.first_page is None and self.last_page is None:
+            return True
+        page = metadata.get("page")
+        if not isinstance(page, int):
+            return False
+        if self.first_page is not None and page < self.first_page - 1:
+            return False
+        if self.last_page is not None and page > self.last_page - 1:
+            return False
+        return True
+
+    def describe(self) -> str:
+        """A short human-readable summary, for labelling answers in the UI."""
+        parts = []
+        if self.chapters:
+            names = [chapter.split(CHAPTER_SEPARATOR)[-1] for chapter in self.chapters]
+            parts.append(", ".join(names))
+        if self.first_page is not None or self.last_page is not None:
+            low = self.first_page if self.first_page is not None else 1
+            high = self.last_page if self.last_page is not None else "end"
+            parts.append(f"pages {low}–{high}")
+        return "; ".join(parts) if parts else "whole report"
+
+
+# Joins a bookmark section to its chapter in the `chapter` metadata value. Kept
+# here rather than in ingest.py because the filter's description splits on it,
+# and retrieval.py must not import ingest.py (which pulls in pypdf and the
+# OpenAI client for no reason).
+CHAPTER_SEPARATOR = " › "
+
+
+@dataclass(frozen=True)
+class Chapter:
+    """One filterable chapter of the store, as the UI offers it."""
+
+    name: str  # the stored `chapter` value, which is what a filter matches
+    first_page: int  # 1-based
+    last_page: int  # 1-based
+    chunks: int
+
+
 def doc_key(doc: Document) -> tuple:
     """Identity of a chunk, for de-duplicating hits across searches.
 
@@ -163,13 +262,25 @@ class BM25Index:
     def __len__(self) -> int:
         return len(self.documents)
 
-    def search(self, query: str, k: int = TOP_K) -> list[Document]:
+    def search(
+        self,
+        query: str,
+        k: int = TOP_K,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> list[Document]:
         """The k best-scoring chunks for `query`, best first.
 
         Zero-scoring chunks are dropped rather than padded in: a chunk sharing
         no term with the query is not a weak match, it is a non-match, and
         passing it on would give it a rank - and therefore fusion score - it
         has not earned.
+
+        A filter is applied before the cut to k, not after, so a filtered
+        search still returns up to k chunks from the allowed part of the report
+        rather than whatever few of the global top k happened to fall inside
+        it. That is how Chroma applies its `where` clause too. Scoring still
+        runs over the whole corpus, so a term's rarity is judged against the
+        whole report either way.
         """
         tokens = tokenize(query)
         if not self.bm25 or not tokens:
@@ -177,7 +288,47 @@ class BM25Index:
 
         scores = self.bm25.get_scores(tokens)
         ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-        return [self.documents[i] for i in ranked[:k] if scores[i] > 0]
+
+        hits = []
+        for i in ranked:
+            if scores[i] <= 0 or len(hits) == k:
+                break
+            doc = self.documents[i]
+            if metadata_filter and not metadata_filter.matches(doc.metadata):
+                continue
+            hits.append(doc)
+        return hits
+
+    def chapters(self) -> list[Chapter]:
+        """Every chapter in the store, in page order, with its extent.
+
+        Read from the chunks already held in memory, so the UI can offer the
+        chapters a deployment actually has - including none, for a store built
+        before ingest.py wrote them - without a PDF to hand or another pass
+        over Chroma.
+        """
+        found: dict[str, list[int]] = {}
+        for doc in self.documents:
+            chapter, page = doc.metadata.get("chapter"), doc.metadata.get("page")
+            if chapter and isinstance(page, int):
+                found.setdefault(chapter, []).append(page)
+
+        chapters = [
+            Chapter(name, min(pages) + 1, max(pages) + 1, len(pages))
+            for name, pages in found.items()
+        ]
+        return sorted(chapters, key=lambda c: (c.first_page, c.last_page))
+
+    def page_count(self) -> int:
+        """The highest 1-based page number any chunk comes from."""
+        pages = [d.metadata.get("page") for d in self.documents]
+        return max((p for p in pages if isinstance(p, int)), default=-1) + 1
+
+    def count(self, metadata_filter: MetadataFilter | None = None) -> int:
+        """How many chunks a filter lets through - 0 means it cannot answer."""
+        if not metadata_filter:
+            return len(self.documents)
+        return sum(metadata_filter.matches(d.metadata) for d in self.documents)
 
 
 def reciprocal_rank_fusion(
@@ -257,7 +408,11 @@ class HybridRetriever:
         self.max_per_page = max_per_page
 
     def search(
-        self, queries: list[str], limit: int, use_bm25: bool = True
+        self,
+        queries: list[str],
+        limit: int,
+        use_bm25: bool = True,
+        metadata_filter: MetadataFilter | None = None,
     ) -> list[Document]:
         """The best `limit` chunks across every query and both retrievers.
 
@@ -278,13 +433,24 @@ class HybridRetriever:
         still more than one ranking to merge. On a single query fusion over one
         ranking is order-preserving - score falls monotonically with rank - so
         the result is exactly that ranking, untouched.
+
+        `metadata_filter` restricts both retrievers to the same part of the
+        report, and is per call for the same reason as `use_bm25`. Without one
+        - or with an empty one - the search is exactly what it was before
+        filtering existed: Chroma is passed no `where` clause at all.
         """
+        where = metadata_filter.to_chroma() if metadata_filter else None
+
         rankings, weights = [], []
         for query in queries:
-            rankings.append(self.vectordb.similarity_search(query, k=self.k))
+            rankings.append(
+                self.vectordb.similarity_search(query, k=self.k, filter=where)
+            )
             weights.append(self.vector_weight)
             if use_bm25:
-                rankings.append(self.bm25.search(query, k=self.k))
+                rankings.append(
+                    self.bm25.search(query, k=self.k, metadata_filter=metadata_filter)
+                )
                 weights.append(self.bm25_weight)
 
         fused = reciprocal_rank_fusion(rankings, weights, self.rrf_k)

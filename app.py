@@ -33,12 +33,13 @@ from ask import (
     MAX_CONTEXT_CHUNKS,
     PdfChatbot,
     SetupError,
+    _is_unknown,
     _page_label,
     explain_api_error,
     is_exit_command,
     open_retriever,
 )
-from retrieval import TOP_K
+from retrieval import TOP_K, MetadataFilter
 
 PDF_NAME = "Umicore Annual Report 2025"
 
@@ -146,16 +147,127 @@ def get_bot() -> PdfChatbot:
     # takes effect on the next question instead of only in a fresh session.
     bot = st.session_state.bot
     bot.use_bm25 = SEARCH_MODES[st.session_state.search_mode][0]
+    bot.metadata_filter = current_filter()
     return bot
 
 
-def render_sources(sources: list, mode: str | None = None) -> None:
+def current_filter() -> MetadataFilter | None:
+    """The sidebar's metadata filter, or None when it restricts nothing.
+
+    The page range only becomes part of the filter once it is narrower than
+    the whole report. Left at full width it would still exclude nothing, but it
+    would also label every answer "filtered" and send Chroma a `where` clause
+    for no reason.
+    """
+    chapters = tuple(st.session_state.get("filter_chapters", ()))
+    first, last = st.session_state.get("filter_pages", (None, None))
+    page_count = get_retriever().bm25.page_count()
+
+    metadata_filter = MetadataFilter(
+        chapters=chapters,
+        first_page=first if first is not None and first > 1 else None,
+        last_page=last if last is not None and last < page_count else None,
+    )
+    return metadata_filter or None
+
+
+def reset_filters(page_count: int) -> None:
+    """Button callback: widen the filter back to the whole report.
+
+    A callback rather than code after the button, because Streamlit only lets
+    a widget's value be set before that widget is drawn in a run - and a
+    callback runs before the rerun draws anything.
+    """
+    st.session_state.filter_chapters = []
+    st.session_state.filter_pages = (1, page_count)
+
+
+def render_filters() -> None:
+    """Sidebar controls for restricting the search by chunk metadata.
+
+    Drawn only after the password gate, because listing the chapters needs the
+    store open. The options are read from the store itself rather than from
+    the PDF, which a deployment does not have - so the list always matches what
+    can actually be searched.
+    """
+    bm25 = get_retriever().bm25
+    chapters = {chapter.name: chapter for chapter in bm25.chapters()}
+    page_count = bm25.page_count()
+
+    # Settle state before the widgets exist. A saved selection naming a chapter
+    # the store no longer has (after a re-ingest) would make the multiselect
+    # raise, and a page range from a longer PDF would fall outside the slider.
+    saved = st.session_state.get("filter_chapters", [])
+    st.session_state.filter_chapters = [name for name in saved if name in chapters]
+    first, last = st.session_state.get("filter_pages", (1, page_count))
+    first = min(max(first, 1), page_count)
+    st.session_state.filter_pages = (first, min(max(last, first), page_count))
+
+    st.subheader("Filter")
+
+    if chapters:
+        st.multiselect(
+            "Report sections",
+            list(chapters),
+            key="filter_chapters",
+            format_func=lambda name: (
+                f"{name} (p. {chapters[name].first_page}–{chapters[name].last_page})"
+            ),
+            placeholder="All sections",
+            help=(
+                "Search only these parts of the report, taken from the PDF's "
+                "bookmarks. Leave empty to search everything."
+            ),
+        )
+    else:
+        st.caption(
+            "This store has no section metadata, so only the page range is "
+            "available. Run `python ingest.py --tag-sections` to add it."
+        )
+
+    if page_count > 1:
+        st.slider(
+            "Pages",
+            min_value=1,
+            max_value=page_count,
+            key="filter_pages",
+            help="Search only chunks from this page range (inclusive).",
+        )
+
+    metadata_filter = current_filter()
+    matching = bm25.count(metadata_filter)
+    if metadata_filter and matching == 0:
+        st.warning(
+            "No part of the report matches both restrictions, so every "
+            "question will be answered \"I don't know about this.\""
+        )
+    elif metadata_filter:
+        st.caption(
+            f"Searching {matching} of {len(bm25)} chunks — "
+            f"{metadata_filter.describe()}."
+        )
+    else:
+        st.caption(f"Searching the whole report ({len(bm25)} chunks).")
+
+    st.button(
+        "Clear filters",
+        on_click=reset_filters,
+        args=(page_count,),
+        disabled=not metadata_filter,
+        use_container_width=True,
+    )
+
+
+def render_sources(
+    sources: list, mode: str | None = None, scope: str | None = None
+) -> None:
     """Page citations for one answer, with the retrieved text behind them.
 
-    `mode` labels which search produced them. Worth carrying per answer rather
-    than reading the sidebar: switching modes mid-conversation would otherwise
-    relabel every earlier answer with the setting now selected, which is
-    exactly backwards when the point of the switch is to compare them.
+    `mode` labels which search produced them and `scope` which filter it ran
+    under. Both are carried per answer rather than read from the sidebar:
+    changing either mid-conversation would otherwise relabel every earlier
+    answer with the setting now selected, which is exactly backwards when the
+    point of changing it is to compare.
     """
     if not sources:
         return
@@ -168,6 +280,8 @@ def render_sources(sources: list, mode: str | None = None) -> None:
             pages.append(page)
 
     label = f" · {mode}" if mode else ""
+    if scope:
+        label += f" · filtered: {scope}"
     with st.expander(f"Sources — {len(sources)} chunks, pages {', '.join(pages)}{label}"):
         st.caption(
             "The exact chunks the answer was written from. Page numbers in the "
@@ -178,6 +292,22 @@ def render_sources(sources: list, mode: str | None = None) -> None:
             st.markdown(f"**{src} — page {_page_label(doc)}**")
             st.text(doc.page_content)
             st.divider()
+
+
+def render_filter_note(text: str, scope: str | None) -> None:
+    """Say so when a filtered search found nothing.
+
+    "I don't know about this." means the report does not contain the answer,
+    and under a filter that is no longer something the bot can know - the
+    answer may sit outside the part searched. The reply itself stays the exact
+    fallback sentence; this caption is what stops a reader taking it as a
+    verdict on the whole report.
+    """
+    if scope and _is_unknown(text):
+        st.caption(
+            f"The search was limited to {scope}. The answer may be elsewhere "
+            "in the report — clear the filters and ask again."
+        )
 
 
 def start_new_chat() -> None:
@@ -218,17 +348,27 @@ def answer(question: str) -> None:
         st.markdown(question)
 
     mode = st.session_state.search_mode
+    metadata_filter = current_filter()
+    scope = metadata_filter.describe() if metadata_filter else None
     with st.chat_message("assistant"):
-        with st.spinner(f"Searching the report ({mode})..."):
+        where = f"; {scope}" if scope else ""
+        with st.spinner(f"Searching the report ({mode}{where})..."):
             try:
                 text, sources = get_bot().ask(question)
             except Exception as exc:  # API/network hiccup - keep the chat alive
                 text, sources = explain_api_error(exc), []
         st.markdown(text)
-        render_sources(sources, mode)
+        render_filter_note(text, scope)
+        render_sources(sources, mode, scope)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": text, "sources": sources, "mode": mode}
+        {
+            "role": "assistant",
+            "content": text,
+            "sources": sources,
+            "mode": mode,
+            "scope": scope,
+        }
     )
 
 
@@ -257,6 +397,11 @@ with st.sidebar:
         ),
     )
     st.caption(SEARCH_MODES[st.session_state.search_mode][1])
+
+    # Filled in by render_filters() once the visitor is past the password gate
+    # - listing the report's sections needs the store open. Reserved here so
+    # the controls still sit beside the search mode rather than at the bottom.
+    filter_box = st.container()
 
     st.subheader("Settings")
     st.caption(
@@ -296,6 +441,9 @@ except SetupError as exc:
     st.info("Run the setup steps in README.md, then reload this page.")
     st.stop()
 
+with filter_box:
+    render_filters()
+
 if "messages" not in st.session_state:
     start_new_chat()
 
@@ -315,7 +463,10 @@ else:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        render_sources(message.get("sources", []), message.get("mode"))
+        render_filter_note(message["content"], message.get("scope"))
+        render_sources(
+            message.get("sources", []), message.get("mode"), message.get("scope")
+        )
 
 # Starter questions, shown only while the chat is genuinely empty.
 if not st.session_state.messages and not pending:
