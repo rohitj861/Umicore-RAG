@@ -1,0 +1,17 @@
+# Evaluation-only dependencies. Install these into evaluation/.venv, never
+# into the app's .venv: in the app's environment, ragas would upgrade
+# langchain-core past the pin in ../requirements.txt and downgrade jiter.
+#
+#   C:\Python314\python.exe -m venv evaluation\.venv
+#   evaluation\.venv\Scripts\python.exe -m pip install -r evaluation\requirements.txt
+#
+# The app's own pins come first, so the RAG pipeline being evaluated runs on
+# exactly the versions it runs on in production, and ragas has to fit round them.
+-r ../requirements.txt
+
+ragas==0.4.3
+
+# ragas pulls in scikit-network (used only by its test-set generator, which
+# this project does not use). Its newest releases have no Python 3.14 wheel and
+# fail to compile; this makes pip pick the newest release that ships one.
+--only-binary scikit-network

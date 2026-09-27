@@ -1,0 +1,22 @@
+[
+  {
+    "user_input": "What was the adjusted EBITDA in 2025?",
+    "reference": "The Group's adjusted EBITDA in 2025 was € 847 million."
+  },
+  {
+    "user_input": "What was the turnover in 2025?",
+    "reference": "Group turnover in 2025 was € 19,374 million (19,374,073 thousand EUR)."
+  },
+  {
+    "user_input": "What was the net profit, Group share, in 2025?",
+    "reference": "Net profit, Group share, in 2025 was € 385 million (384,548 thousand EUR)."
+  },
+  {
+    "user_input": "How many employees does the group have?",
+    "reference": "The Group has 11,230 employees in its fully consolidated companies."
+  },
+  {
+    "user_input": "What was the adjusted EBITDA in 2024 and 2025?",
+    "reference": "The Group's adjusted EBITDA was € 763 million in 2024 and € 847 million in 2025."
+  }
+]
